@@ -5,6 +5,7 @@ import { computeMicLevels, smoothLevel } from "../utils/micAudioMath";
 interface DictationButtonProps {
   dictating: boolean;
   micStream?: MediaStream | null;
+  disabled?: boolean;
   onToggle: () => void;
 }
 
@@ -21,6 +22,7 @@ type WebkitWindow = Window & {
 export function DictationButton({
   dictating,
   micStream,
+  disabled = false,
   onToggle,
 }: DictationButtonProps) {
   const [meterReady, setMeterReady] = useState(false);
@@ -197,17 +199,20 @@ export function DictationButton({
   return (
     <button
       type="button"
+      disabled={disabled}
       onClick={onToggle}
       aria-pressed={dictating}
       aria-label={
-        dictating
-          ? "Auto-dictation active — click to mute"
-          : "Start automatic voice dictation"
+        disabled
+          ? "Voice dictation disabled while viewing product"
+          : dictating
+            ? "Auto-dictation active — click to mute"
+            : "Start automatic voice dictation"
       }
-      className={`min-h-[40px] min-w-[196px] px-3.5 py-2 rounded-lg border text-xs font-medium flex items-center justify-center gap-2 whitespace-nowrap shrink-0 ${
+      className={`min-h-[40px] min-w-[196px] px-3.5 py-2 rounded-lg border text-xs font-medium flex items-center justify-center gap-2 whitespace-nowrap shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${
         dictating
           ? "border-[#1F4E3D] bg-[#ECFDF5] text-[#14532D]"
-          : "border-[#E7E5E0] bg-white text-[#18181B] hover:border-[#18181B]"
+          : "border-[#E7E5E0] bg-white text-[#18181B] hover:border-[#18181B] disabled:hover:border-[#E7E5E0]"
       }`}
     >
       {dictating ? (

@@ -11,6 +11,7 @@ interface DecisionStatusPanelProps {
   decision: ShoppingDecisionResult | null;
   interpretation: SpaceQueryInterpretation | null;
   preventedSearchCount: number;
+  disabled?: boolean;
   onRemoveConstraint: (index: number) => void;
 }
 
@@ -62,6 +63,7 @@ export function DecisionStatusPanel({
   decision,
   interpretation,
   preventedSearchCount,
+  disabled = false,
   onRemoveConstraint,
 }: DecisionStatusPanelProps) {
   const [expanded, setExpanded] = useState(false);
@@ -269,9 +271,14 @@ export function DecisionStatusPanel({
                 <button
                   key={`${constraint.kind}-${constraint.text}-${idx}`}
                   type="button"
+                  disabled={disabled}
                   onClick={() => onRemoveConstraint(idx)}
-                  title="Click to relax or remove this constraint"
-                  className={`px-2.5 py-1 rounded-md border text-[11px] font-medium flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${getConstraintButtonClasses(
+                  title={
+                    disabled
+                      ? "Close product details to modify search constraints"
+                      : "Click to relax or remove this constraint"
+                  }
+                  className={`px-2.5 py-1 rounded-md border text-[11px] font-medium flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${getConstraintButtonClasses(
                     constraint.kind,
                   )}`}
                 >

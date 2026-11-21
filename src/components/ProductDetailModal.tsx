@@ -140,6 +140,17 @@ export function ProductDetailModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [product?.id, country, currency]);
 
+  useEffect(() => {
+    if (!product) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [product, onClose]);
+
   const hasAutoVerifyTargets =
     activeConstraints.length > 0 ||
     (typeof maxPriceUsd === "number" && maxPriceUsd > 0);
@@ -300,6 +311,11 @@ export function ProductDetailModal({
       role="dialog"
       aria-modal="true"
       aria-label={activeProduct.title}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) {
+          onClose();
+        }
+      }}
     >
       <div className="relative w-full max-w-5xl max-h-[92vh] overflow-y-auto bg-white rounded-t-3xl sm:rounded-xl border border-[#E7E5E0] shadow-2xl grid grid-cols-1 md:grid-cols-2">
         <button

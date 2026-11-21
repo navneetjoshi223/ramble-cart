@@ -10,6 +10,7 @@ import {
   Sparkles,
   RefreshCw,
   Radio,
+  Loader2,
 } from "lucide-react";
 import type {
   DecisionTriggerSource,
@@ -75,6 +76,8 @@ export function App() {
   const [interpretError, setInterpretError] = useState<string | null>(null);
 
   const searchAbortRef = useRef<AbortController | null>(null);
+  const interpretAbortRef = useRef<AbortController | null>(null);
+  const inspectedProductRef = useRef<NormalizedProduct | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const videoFramesRef = useRef<string[]>([]);
@@ -104,6 +107,13 @@ export function App() {
   const dictatingRef = useRef(false);
   const interpretingRef = useRef(false);
 
+  const isSearchDisabled = inspectedProduct !== null;
+  const isProcessingSearch = searching || interpreting;
+
+  useEffect(() => {
+    inspectedProductRef.current = inspectedProduct;
+  }, [inspectedProduct]);
+
   useEffect(() => {
     runSearch("ceramic coffee dripper");
     // Auto-start dictation on mount ONLY if microphone permission was already granted
@@ -112,7 +122,7 @@ export function App() {
       navigator.permissions
         .query({ name: "microphone" as PermissionName })
         .then((status) => {
-          if (status.state === "granted") {
+          if (status.state === "granted" && !inspectedProductRef.current) {
             void startAutoDictation(true);
           }
         })
@@ -120,6 +130,7 @@ export function App() {
     }
     return () => {
       searchAbortRef.current?.abort();
+      interpretAbortRef.current?.abort();
       stopDictation(false);
       stopCamera();
     };
@@ -138,6 +149,10 @@ export function App() {
     overrideQuery?: string,
     options: { cursor?: string; append?: boolean; overrideMaxUsd?: number | null } = {},
   ) {
+    if (inspectedProductRef.current) {
+      return;
+    }
+
     const activeQuery = (overrideQuery ?? query).trim();
     if (!activeQuery) {
       setSearchError("Enter a product keyword to search Shop MCP.");
@@ -178,6 +193,9 @@ export function App() {
         }),
         signal: controller.signal,
       });
+      if (inspectedProductRef.current || controller.signal.aborted) {
+        return;
+      }
       if (options.append && searchResult) {
         setSearchResult({
           ...typed,
@@ -190,9 +208,11 @@ export function App() {
       if (err instanceof Error && err.name === "AbortError") {
         return;
       }
-      setSearchError(
-        err instanceof Error ? err.message : "Could not reach Shop MCP search.",
-      );
+      if (!inspectedProductRef.current) {
+        setSearchError(
+          err instanceof Error ? err.message : "Could not reach Shop MCP search.",
+        );
+      }
     } finally {
       if (searchAbortRef.current === controller) {
         setSearching(false);
@@ -203,7 +223,10 @@ export function App() {
 
   function handleSearchSubmit(e: FormEvent) {
     e.preventDefault();
-    runSearch();
+    if (isSearchDisabled || inspectedProductRef.current) {
+      return;
+    }
+    void runSearch();
   }
 
   useEffect(() => {
@@ -253,21 +276,29 @@ export function App() {
 
   // Optional continuous Live Auto-Search sync from rolling 1 FPS video stream
   useEffect(() => {
-    if (!cameraActive || !liveAutoSync) return;
+    if (!cameraActive || !liveAutoSync || isSearchDisabled) return;
     const syncTimer = window.setInterval(() => {
-      if (!interpretingRef.current && videoFramesRef.current.length > 0) {
+      if (
+        !interpretingRef.current &&
+        !inspectedProductRef.current &&
+        videoFramesRef.current.length > 0
+      ) {
         void handleInterpretAndSearch("live_auto_sync");
       }
     }, 5000);
     return () => window.clearInterval(syncTimer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cameraActive, liveAutoSync]);
+  }, [cameraActive, liveAutoSync, isSearchDisabled]);
 
   async function startCamera(preferredFacing: "environment" | "user" = facingMode) {
     setCameraError(null);
 
     // Auto-start live voice dictation on this user gesture if not already active
-    if (!dictatingRef.current && !startingDictationRef.current) {
+    if (
+      !dictatingRef.current &&
+      !startingDictationRef.current &&
+      !inspectedProductRef.current
+    ) {
       void startAutoDictation(true);
     }
 
@@ -469,6 +500,9 @@ export function App() {
       }
 
       if ((msg.type === "interim" || msg.type === "final") && typeof msg.text === "string") {
+        if (inspectedProductRef.current) {
+          return;
+        }
         consecutiveQuickEndsRef.current = 0;
         const nextState = applyLiveTranscriptionChunk(liveTranscriptRef.current, {
           type: msg.type,
@@ -488,6 +522,9 @@ export function App() {
         }
         speechPauseTimerRef.current = window.setTimeout(() => {
           speechPauseTimerRef.current = null;
+          if (inspectedProductRef.current) {
+            return;
+          }
           liveTranscriptRef.current = {
             ...liveTranscriptRef.current,
             replaceOnNextSpeech: true,
@@ -559,7 +596,7 @@ export function App() {
   }
 
   async function startAutoDictation(silentIfUnsupported = false) {
-    if (startingDictationRef.current) return;
+    if (startingDictationRef.current || inspectedProductRef.current) return;
     if (!silentIfUnsupported) {
       setInterpretError(null);
     }
@@ -602,8 +639,8 @@ export function App() {
         });
       }
 
-      // User may have clicked mute while the permission prompt was open
-      if (!autoDictateEnabledRef.current) {
+      // User may have clicked mute or selected a product while the permission prompt was open
+      if (!autoDictateEnabledRef.current || inspectedProductRef.current) {
         stream.getTracks().forEach((track) => track.stop());
         return;
       }
@@ -705,9 +742,46 @@ export function App() {
     }
   }
 
+  function cancelActiveSearchStreams() {
+    if (speechPauseTimerRef.current) {
+      window.clearTimeout(speechPauseTimerRef.current);
+      speechPauseTimerRef.current = null;
+    }
+    stopDictation(false);
+    setLiveAutoSync(false);
+
+    if (interpretAbortRef.current) {
+      interpretAbortRef.current.abort();
+      interpretAbortRef.current = null;
+    }
+    interpretingRef.current = false;
+    setInterpreting(false);
+
+    if (searchAbortRef.current) {
+      searchAbortRef.current.abort();
+      searchAbortRef.current = null;
+    }
+    setSearching(false);
+    setLoadingMore(false);
+  }
+
+  function handleSelectProduct(product: NormalizedProduct) {
+    inspectedProductRef.current = product;
+    cancelActiveSearchStreams();
+    setInspectedProduct(product);
+  }
+
+  function handleCloseProduct() {
+    inspectedProductRef.current = null;
+    setInspectedProduct(null);
+  }
+
   function toggleDictation() {
     if (dictatingRef.current || dictating || startingDictationRef.current) {
       stopDictation(true);
+      return;
+    }
+    if (inspectedProductRef.current) {
       return;
     }
     void startAutoDictation(false);
@@ -716,6 +790,10 @@ export function App() {
   async function handleInterpretAndSearch(
     triggerSource: DecisionTriggerSource = "manual_submit",
   ) {
+    if (inspectedProductRef.current) {
+      return;
+    }
+
     if (cameraActive) {
       sampleCurrentVideoFrame();
     }
@@ -728,6 +806,10 @@ export function App() {
       );
       return;
     }
+
+    interpretAbortRef.current?.abort();
+    const controller = new AbortController();
+    interpretAbortRef.current = controller;
 
     interpretingRef.current = true;
     setInterpreting(true);
@@ -755,8 +837,13 @@ export function App() {
                 }
               : null,
           }),
+          signal: controller.signal,
         },
       );
+
+      if (inspectedProductRef.current || controller.signal.aborted) {
+        return;
+      }
 
       setLatestDecision(response.decision);
 
@@ -776,16 +863,25 @@ export function App() {
         overrideMaxUsd: parsed.maxPriceUsd,
       });
     } catch (err) {
-      setInterpretError(
-        err instanceof Error ? err.message : "Live video interpretation failed.",
-      );
+      if (err instanceof Error && err.name === "AbortError") {
+        return;
+      }
+      if (!inspectedProductRef.current) {
+        setInterpretError(
+          err instanceof Error ? err.message : "Live video interpretation failed.",
+        );
+      }
     } finally {
-      interpretingRef.current = false;
-      setInterpreting(false);
+      if (interpretAbortRef.current === controller) {
+        interpretAbortRef.current = null;
+        interpretingRef.current = false;
+        setInterpreting(false);
+      }
     }
   }
 
   function handleRemoveConstraint(index: number) {
+    if (inspectedProductRef.current) return;
     const current = interpretationRef.current;
     if (!current) return;
     const removed = current.activeConstraints[index];
@@ -945,8 +1041,9 @@ export function App() {
 
                       <button
                         type="button"
+                        disabled={isSearchDisabled}
                         onClick={() => setLiveAutoSync((v) => !v)}
-                        className={`min-h-[40px] px-3 py-2 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition-colors ${
+                        className={`min-h-[40px] px-3 py-2 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                           liveAutoSync
                             ? "border-[#1F4E3D] bg-[#1F4E3D] text-white"
                             : "border-[#E7E5E0] bg-white text-[#18181B] hover:border-[#18181B]"
@@ -973,12 +1070,14 @@ export function App() {
                     <DictationButton
                       dictating={dictating}
                       micStream={micStream}
+                      disabled={isSearchDisabled}
                       onToggle={toggleDictation}
                     />
                   </div>
                   <textarea
                     id="space-ramble"
                     rows={2}
+                    disabled={isSearchDisabled}
                     value={rambleText}
                     onChange={(e) => {
                       const val = e.target.value;
@@ -996,13 +1095,14 @@ export function App() {
                       }
                     }}
                     placeholder="Speak freely while panning your camera—auto-dictation transcribes and searches when you pause."
-                    className="w-full rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] px-3.5 py-2.5 text-sm focus:bg-white focus:outline-none focus:border-[#1F4E3D]"
+                    className="w-full rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] px-3.5 py-2.5 text-sm focus:bg-white focus:outline-none focus:border-[#1F4E3D] disabled:opacity-60 disabled:cursor-not-allowed"
                   />
 
                   <DecisionStatusPanel
                     decision={latestDecision}
                     interpretation={interpretation}
                     preventedSearchCount={preventedSearchCount}
+                    disabled={isSearchDisabled}
                     onRemoveConstraint={handleRemoveConstraint}
                   />
 
@@ -1012,11 +1112,12 @@ export function App() {
                       {rambleText.trim() && (
                         <button
                           type="button"
+                          disabled={isSearchDisabled}
                           onClick={() => {
                             setQuery(rambleText.trim());
-                            runSearch(rambleText.trim());
+                            void runSearch(rambleText.trim());
                           }}
-                          className="px-2.5 py-1.5 rounded bg-[#18181B] text-white text-xs font-medium whitespace-nowrap shrink-0 self-start sm:self-auto"
+                          className="px-2.5 py-1.5 rounded bg-[#18181B] text-white text-xs font-medium whitespace-nowrap shrink-0 self-start sm:self-auto disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           Search Shop MCP Directly
                         </button>
@@ -1028,14 +1129,20 @@ export function App() {
                 <button
                   type="button"
                   onClick={() => void handleInterpretAndSearch("manual_submit")}
-                  disabled={interpreting}
-                  className="min-h-[44px] px-4 py-2.5 rounded-lg bg-[#1F4E3D] text-white text-xs font-medium hover:bg-[#173B2E] disabled:opacity-60 flex items-center justify-center gap-2 self-start"
+                  disabled={isProcessingSearch || isSearchDisabled}
+                  className="min-h-[44px] px-4 py-2.5 rounded-lg bg-[#1F4E3D] text-white text-xs font-medium hover:bg-[#173B2E] disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2 self-start"
                 >
-                  <Sparkles className="w-3.5 h-3.5" />
+                  {isProcessingSearch ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                  ) : (
+                    <Sparkles className="w-3.5 h-3.5 shrink-0" />
+                  )}
                   <span>
                     {interpreting
                       ? "Evaluating Decision & Space..."
-                      : "Interpret Live Video & Search"}
+                      : searching
+                        ? "Searching Catalog..."
+                        : "Interpret Live Video & Search"}
                   </span>
                 </button>
               </div>
@@ -1045,92 +1152,124 @@ export function App() {
           {/* Direct Shop MCP Search Form */}
           <form
             onSubmit={handleSearchSubmit}
-            className="bg-white rounded-xl border border-[#E7E5E0] p-4 sm:p-5 space-y-4"
+            aria-disabled={isSearchDisabled}
+            aria-busy={isProcessingSearch}
+            className="bg-white rounded-xl border border-[#E7E5E0] p-4 sm:p-5"
           >
-            <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
-              <div className="md:col-span-6 relative">
-                <Search className="w-4 h-4 text-[#57534E] absolute left-3.5 top-1/2 -translate-y-1/2" />
-                <input
-                  type="text"
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Search Shopify catalog (e.g. ceramic coffee dripper)"
-                  aria-label="Product search query"
-                  className="w-full min-h-[44px] pl-10 pr-4 py-2.5 text-sm rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] focus:bg-white focus:outline-none focus:border-[#1F4E3D]"
-                />
-              </div>
+            <fieldset disabled={isSearchDisabled} className="space-y-4 disabled:opacity-60">
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
+                <div className="md:col-span-5 relative">
+                  {isProcessingSearch ? (
+                    <Loader2
+                      aria-hidden="true"
+                      className="w-4 h-4 text-[#1F4E3D] animate-spin absolute left-3.5 top-1/2 -translate-y-1/2"
+                    />
+                  ) : (
+                    <Search
+                      aria-hidden="true"
+                      className="w-4 h-4 text-[#57534E] absolute left-3.5 top-1/2 -translate-y-1/2"
+                    />
+                  )}
+                  <input
+                    type="text"
+                    disabled={isSearchDisabled}
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search Shopify catalog (e.g. ceramic coffee dripper)"
+                    aria-label="Product search query"
+                    className="w-full min-h-[44px] pl-10 pr-4 py-2.5 text-sm rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] focus:bg-white focus:outline-none focus:border-[#1F4E3D] disabled:cursor-not-allowed"
+                  />
+                </div>
 
-              <div className="md:col-span-3">
-                <select
-                  aria-label="Shipping country and currency"
-                  value={`${country}:${currency}`}
-                  onChange={(e) => {
-                    const [c, curr] = e.target.value.split(":");
-                    setCountry(c);
-                    setCurrency(curr);
-                  }}
-                  className="w-full min-h-[44px] px-3 py-2.5 text-xs font-medium rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] focus:bg-white focus:outline-none focus:border-[#1F4E3D]"
-                >
-                  {COUNTRY_CURRENCY_OPTIONS.map((opt) => (
-                    <option key={opt.country} value={`${opt.country}:${opt.currency}`}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="md:col-span-2">
-                <input
-                  type="number"
-                  min="1"
-                  step="any"
-                  value={maxPriceInput}
-                  onChange={(e) => setMaxPriceInput(e.target.value)}
-                  placeholder={`Max (${currency})`}
-                  aria-label="Maximum price"
-                  className="w-full min-h-[44px] px-3 py-2.5 text-xs font-mono-tabular rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] focus:bg-white focus:outline-none focus:border-[#1F4E3D]"
-                />
-              </div>
-
-              <div className="md:col-span-1">
-                <button
-                  type="submit"
-                  disabled={searching}
-                  className="w-full min-h-[44px] px-4 py-2.5 rounded-lg bg-[#1F4E3D] text-white text-xs font-medium hover:bg-[#173B2E] disabled:opacity-60 transition-colors whitespace-nowrap"
-                >
-                  {searching ? "..." : "Search"}
-                </button>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center justify-between gap-3 pt-1 text-xs text-[#57534E]">
-              <div className="flex flex-wrap items-center gap-2">
-                <span>Try:</span>
-                {SAMPLE_QUERIES.map((q) => (
-                  <button
-                    key={q}
-                    type="button"
-                    onClick={() => {
-                      setQuery(q);
-                      runSearch(q);
+                <div className="md:col-span-3">
+                  <select
+                    aria-label="Shipping country and currency"
+                    disabled={isSearchDisabled}
+                    value={`${country}:${currency}`}
+                    onChange={(e) => {
+                      const [c, curr] = e.target.value.split(":");
+                      setCountry(c);
+                      setCurrency(curr);
                     }}
-                    className="px-2.5 py-1 rounded border border-[#E7E5E0] bg-[#F7F6F3] hover:border-[#18181B] text-[#18181B] transition-colors"
+                    className="w-full min-h-[44px] px-3 py-2.5 text-xs font-medium rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] focus:bg-white focus:outline-none focus:border-[#1F4E3D] disabled:cursor-not-allowed"
                   >
-                    {q}
+                    {COUNTRY_CURRENCY_OPTIONS.map((opt) => (
+                      <option key={opt.country} value={`${opt.country}:${opt.currency}`}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="md:col-span-2">
+                  <input
+                    type="number"
+                    min="1"
+                    step="any"
+                    disabled={isSearchDisabled}
+                    value={maxPriceInput}
+                    onChange={(e) => setMaxPriceInput(e.target.value)}
+                    placeholder={`Max (${currency})`}
+                    aria-label="Maximum price"
+                    className="w-full min-h-[44px] px-3 py-2.5 text-xs font-mono-tabular rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] focus:bg-white focus:outline-none focus:border-[#1F4E3D] disabled:cursor-not-allowed"
+                  />
+                </div>
+
+                <div className="md:col-span-2">
+                  <button
+                    type="submit"
+                    disabled={isProcessingSearch || isSearchDisabled}
+                    className="w-full min-h-[44px] px-4 py-2.5 rounded-lg bg-[#1F4E3D] text-white text-xs font-medium hover:bg-[#173B2E] disabled:opacity-60 disabled:cursor-not-allowed transition-colors whitespace-nowrap flex items-center justify-center gap-2"
+                  >
+                    {isProcessingSearch && (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                    )}
+                    <span>
+                      {searching
+                        ? "Searching..."
+                        : interpreting
+                          ? "Processing..."
+                          : "Search"}
+                    </span>
                   </button>
-                ))}
+                </div>
               </div>
 
-              <label className="flex items-center gap-2 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={availableOnly}
-                  onChange={(e) => setAvailableOnly(e.target.checked)}
-                  className="rounded border-[#D6D3D1] accent-[#1F4E3D]"
-                />
-                <span>In-stock items only</span>
-              </label>
-            </div>
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-1 text-xs text-[#57534E]">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span>Try:</span>
+                  {SAMPLE_QUERIES.map((q) => (
+                    <button
+                      key={q}
+                      type="button"
+                      disabled={isSearchDisabled}
+                      onClick={() => {
+                        setQuery(q);
+                        void runSearch(q);
+                      }}
+                      className="px-2.5 py-1 rounded border border-[#E7E5E0] bg-[#F7F6F3] hover:border-[#18181B] text-[#18181B] transition-colors disabled:cursor-not-allowed disabled:hover:border-[#E7E5E0]"
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
+
+                <label
+                  className={`flex items-center gap-2 select-none ${
+                    isSearchDisabled ? "cursor-not-allowed" : "cursor-pointer"
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    disabled={isSearchDisabled}
+                    checked={availableOnly}
+                    onChange={(e) => setAvailableOnly(e.target.checked)}
+                    className="rounded border-[#D6D3D1] accent-[#1F4E3D] disabled:cursor-not-allowed"
+                  />
+                  <span>In-stock items only</span>
+                </label>
+              </div>
+            </fieldset>
           </form>
         </section>
 
@@ -1181,6 +1320,34 @@ export function App() {
             )}
           </div>
 
+          {isProcessingSearch && (
+            <div
+              role="status"
+              aria-live="polite"
+              data-testid="search-processing-loader"
+              className="bg-white rounded-xl border border-[#E7E5E0] overflow-hidden"
+            >
+              <div className="p-4 sm:px-5 flex items-center gap-3.5">
+                <Loader2 className="w-5 h-5 text-[#1F4E3D] animate-spin shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-[#18181B] truncate">
+                    {interpreting
+                      ? "Analyzing your space & search request..."
+                      : `Searching Shopify merchants for “${query.trim() || "products"}”...`}
+                  </p>
+                  <p className="text-xs text-[#57534E] mt-0.5">
+                    {interpreting
+                      ? "Evaluating active constraints before querying the catalog"
+                      : "Fetching live product pricing, variants, and stock availability"}
+                  </p>
+                </div>
+              </div>
+              <div className="h-1 w-full bg-[#ECEAE4] overflow-hidden">
+                <div className="h-full w-1/3 bg-[#1F4E3D] rounded-full animate-search-progress" />
+              </div>
+            </div>
+          )}
+
           {searching ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
               {[0, 1, 2, 3, 4, 5].map((skeleton) => (
@@ -1208,7 +1375,11 @@ export function App() {
             </div>
           ) : (
             <>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+              <div
+                className={`grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6 transition-opacity ${
+                  interpreting ? "opacity-55" : ""
+                }`}
+              >
                 {searchResult?.products.map((product) => {
                   const v = product.primaryVariant;
                   const image = v?.media[0]?.url ?? product.media[0]?.url ?? "";
@@ -1225,7 +1396,7 @@ export function App() {
                       className="bg-white rounded-xl border border-[#E7E5E0] overflow-hidden flex flex-col transition-transform duration-200 hover:-translate-y-0.5 hover:shadow-md"
                     >
                       <div
-                        onClick={() => setInspectedProduct(product)}
+                        onClick={() => handleSelectProduct(product)}
                         className="aspect-[4/3] bg-[#ECEAE4] cursor-pointer overflow-hidden"
                       >
                         <ProductImage
@@ -1261,7 +1432,7 @@ export function App() {
                           <div className="flex items-baseline justify-between gap-3">
                             <button
                               type="button"
-                              onClick={() => setInspectedProduct(product)}
+                              onClick={() => handleSelectProduct(product)}
                               className="text-left text-base font-semibold text-[#18181B] hover:underline underline-offset-2 line-clamp-2"
                             >
                               {product.title}
@@ -1281,7 +1452,7 @@ export function App() {
                         <div className="flex items-center gap-2 pt-2 border-t border-[#E7E5E0]">
                           <button
                             type="button"
-                            onClick={() => setInspectedProduct(product)}
+                            onClick={() => handleSelectProduct(product)}
                             className="flex-1 min-h-[40px] py-2 px-3 rounded-lg bg-[#18181B] text-white text-xs font-medium hover:bg-[#27272A] transition-colors whitespace-nowrap"
                           >
                             Product Details
@@ -1292,6 +1463,7 @@ export function App() {
                               href={v.url}
                               target="_blank"
                               rel="noopener noreferrer"
+                              onClick={() => cancelActiveSearchStreams()}
                               className="min-h-[40px] py-2 px-3.5 rounded-lg border border-[#E7E5E0] text-xs font-medium text-[#18181B] hover:border-[#18181B] transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
                             >
                               <span>Seller</span>
@@ -1309,16 +1481,21 @@ export function App() {
                 <div className="pt-4 flex justify-center">
                   <button
                     type="button"
-                    disabled={loadingMore}
+                    disabled={loadingMore || isProcessingSearch || isSearchDisabled}
                     onClick={() =>
-                      runSearch(searchResult.query, {
+                      void runSearch(searchResult.query, {
                         cursor: searchResult.pagination.cursor ?? undefined,
                         append: true,
                       })
                     }
-                    className="min-h-[44px] px-6 py-2.5 rounded-lg border border-[#18181B] text-xs font-medium text-[#18181B] hover:bg-[#18181B] hover:text-white disabled:opacity-50 transition-colors"
+                    className="min-h-[44px] px-6 py-2.5 rounded-lg border border-[#18181B] text-xs font-medium text-[#18181B] hover:bg-[#18181B] hover:text-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
                   >
-                    {loadingMore ? "Loading more products..." : "Load More Results"}
+                    {loadingMore && (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                    )}
+                    <span>
+                      {loadingMore ? "Loading more products..." : "Load More Results"}
+                    </span>
                   </button>
                 </div>
               )}
@@ -1346,7 +1523,7 @@ export function App() {
             : null)
         }
         spatialSummary={interpretation?.sceneSummary ?? null}
-        onClose={() => setInspectedProduct(null)}
+        onClose={handleCloseProduct}
       />
     </div>
   );
