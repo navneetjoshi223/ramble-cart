@@ -21,7 +21,7 @@ import type {
 } from "./src/types.js";
 
 const PORT = Number(process.env.PORT) || 3000;
-const shopRateLimiter = new SlidingWindowRateLimiter(60, 60_000);
+const shopRateLimiter = new SlidingWindowRateLimiter(30, 60_000);
 
 function getClientKey(req: express.Request): string {
   const forwarded = req.headers["x-forwarded-for"];
@@ -200,10 +200,8 @@ async function startServer() {
             : null,
       });
 
-      if (res.writableEnded || res.destroyed) return;
       res.json(evidence);
     } catch (err) {
-      if (res.writableEnded || res.destroyed) return;
       handleGeminiRouteError(res, "/api/shop/product/evidence", err);
     }
   });

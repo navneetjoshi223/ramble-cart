@@ -10,56 +10,26 @@ import {
   Sparkles,
   RefreshCw,
   Radio,
-  Ruler,
-  CheckCircle2,
-  AlertCircle,
-  HelpCircle,
-  X,
 } from "lucide-react";
 import type {
-  ActiveSpatialLimit,
-  BatchShelfFitEntry,
   DecisionTriggerSource,
-  GetProductResult,
   NormalizedProduct,
-  ProductEvidenceResult,
   RambleInterpretResponse,
-  ResultViewMode,
   SearchCatalogResult,
-  ShelfCalibrationResult,
   ShoppingDecisionResult,
   SpaceQueryInterpretation,
-  WidthFitVerdict,
 } from "./types";
 import { ProductImage } from "./components/ProductImage";
 import { ProductDetailModal } from "./components/ProductDetailModal";
 import { DictationButton } from "./components/DictationButton";
 import { DecisionStatusPanel } from "./components/DecisionStatusPanel";
-import {
-  ShelfCalibrationPanel,
-  type FrozenCameraFrame,
-} from "./components/ShelfCalibrationPanel";
 import { safeFetchJson } from "./utils/safeFetchJson";
-import {
-  calibrationToSpatialLimit,
-  detectPhysicalFitIntent,
-  evaluateSpatialLimitFit,
-  extractSelectedVariantDimension,
-  parseSpokenDimensionLimit,
-  stripSpokenDimensionPhrase,
-} from "./utils/widthFitCheck";
-import {
-  BATCH_SHELF_CHECK_LIMIT,
-  MAX_CONCURRENT_SHELF_CHECKS,
-  orderProductsForViewMode,
-  runBoundedVerificationBatch,
-} from "./utils/batchVerifyQueue";
 
 const SAMPLE_QUERIES = [
   "ceramic coffee dripper",
   "matte black monitor stand",
-  "linen throw pillow",
   "brushed brass desk lamp",
+  "walnut valet tray",
 ];
 
 const COUNTRY_CURRENCY_OPTIONS = [
@@ -69,41 +39,8 @@ const COUNTRY_CURRENCY_OPTIONS = [
   { country: "JP", currency: "JPY", label: "Japan (JPY)" },
 ];
 
-function getCardFitVerdictStyle(verdict: WidthFitVerdict) {
-  switch (verdict) {
-    case "Width fits":
-    case "Height fits":
-    case "Depth fits":
-      return {
-        textClass: "text-[#14532D]",
-        Icon: CheckCircle2,
-      };
-    case "Too wide":
-    case "Too tall":
-    case "Too deep":
-      return {
-        textClass: "text-[#991B1B]",
-        Icon: AlertCircle,
-      };
-    case "Too close to confirm":
-      return {
-        textClass: "text-[#9A3412]",
-        Icon: AlertCircle,
-      };
-    case "Width unknown":
-    case "Height unknown":
-    case "Depth unknown":
-    case "Fit unknown":
-    default:
-      return {
-        textClass: "text-[#57534E]",
-        Icon: HelpCircle,
-      };
-  }
-}
-
 export function App() {
-  // Default camera-and-voice shopping state across all product categories
+  // Search state
   const [query, setQuery] = useState("ceramic coffee dripper");
   const [country, setCountry] = useState("US");
   const [currency, setCurrency] = useState("USD");
@@ -119,27 +56,10 @@ export function App() {
   // Live Video & Voice Stream Input for Shop MCP search
   const [spaceOpen, setSpaceOpen] = useState(true);
   const [cameraActive, setCameraActive] = useState(false);
-  const [awaitingMeasureFreeze, setAwaitingMeasureFreeze] = useState(false);
   const [facingMode, setFacingMode] = useState<"environment" | "user">("environment");
   const [liveFrameCount, setLiveFrameCount] = useState(0);
   const [liveAutoSync, setLiveAutoSync] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
-
-  // Opt-in Spatial Measurement, Spoken Limit & Batch Fit Verification state
-  const [frozenFrame, setFrozenFrame] = useState<FrozenCameraFrame | null>(null);
-  const [shelfCalibration, setShelfCalibration] = useState<ShelfCalibrationResult | null>(
-    null,
-  );
-  const [clearanceInches, setClearanceInches] = useState<number>(0.5);
-  const [dismissedSpokenKey, setDismissedSpokenKey] = useState<string | null>(null);
-  const [fitManuallyRequested, setFitManuallyRequested] = useState(false);
-  const [measurementSkipped, setMeasurementSkipped] = useState(false);
-  const [resultViewMode, setResultViewMode] = useState<ResultViewMode>("standard");
-  const [batchFitByProductId, setBatchFitByProductId] = useState<
-    Record<string, BatchShelfFitEntry>
-  >({});
-  const [batchChecking, setBatchChecking] = useState(false);
-
   const [rambleText, setRambleText] = useState("");
   const [dictating, setDictating] = useState(false);
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
@@ -150,19 +70,6 @@ export function App() {
   const [interpretError, setInterpretError] = useState<string | null>(null);
 
   const searchAbortRef = useRef<AbortController | null>(null);
-  const batchAbortRef = useRef<AbortController | null>(null);
-  const batchRunIdRef = useRef(0);
-  const prevSpokenKeyRef = useRef<string | null>(null);
-  const productInspectionCacheRef = useRef<
-    Map<
-      string,
-      {
-        productDetail: NormalizedProduct;
-        neonEvidence: ProductEvidenceResult | null;
-      }
-    >
-  >(new Map());
-
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -181,57 +88,8 @@ export function App() {
   const interpretingRef = useRef(false);
   const recognitionRef = useRef<{ start: () => void; stop: () => void } | null>(null);
 
-  // Derive spoken dimension limit (e.g. "at most 20 inches wide") so the shopper skips the card step
-  const rawSpokenLimit =
-    parseSpokenDimensionLimit(rambleText, interpretation) ??
-    parseSpokenDimensionLimit(query, null);
-  const rawSpokenKey = rawSpokenLimit
-    ? `${rawSpokenLimit.axis}:${rawSpokenLimit.maxMm.toFixed(1)}`
-    : null;
-
   useEffect(() => {
-    if (rawSpokenKey && rawSpokenKey !== prevSpokenKeyRef.current) {
-      prevSpokenKeyRef.current = rawSpokenKey;
-      setDismissedSpokenKey(null);
-      setFrozenFrame(null);
-      setShelfCalibration(null);
-      setAwaitingMeasureFreeze(false);
-      setMeasurementSkipped(false);
-      setResultViewMode("scenecart");
-    } else if (!rawSpokenKey) {
-      prevSpokenKeyRef.current = null;
-    }
-  }, [rawSpokenKey]);
-
-  const activeSpokenLimit: ActiveSpatialLimit | null =
-    rawSpokenLimit && rawSpokenKey !== dismissedSpokenKey ? rawSpokenLimit : null;
-
-  const measuredSpatialLimit: ActiveSpatialLimit | null = shelfCalibration
-    ? calibrationToSpatialLimit(shelfCalibration, clearanceInches)
-    : null;
-
-  const activeSpatialLimit: ActiveSpatialLimit | null =
-    measuredSpatialLimit ?? activeSpokenLimit;
-
-  const fitIntent = detectPhysicalFitIntent({
-    rambleText,
-    queryText: query,
-    interpretation,
-    decision: latestDecision,
-  });
-
-  const fitRequested = fitIntent.requested || fitManuallyRequested;
-  const showMeasureSpaceOffer =
-    fitIntent.requested &&
-    !activeSpatialLimit &&
-    !measurementSkipped &&
-    !frozenFrame &&
-    !awaitingMeasureFreeze;
-  const showSkippedFitUnknown =
-    fitRequested && measurementSkipped && !activeSpatialLimit;
-
-  useEffect(() => {
-    void runSearch("ceramic coffee dripper");
+    runSearch("ceramic coffee dripper");
     // Auto-start dictation on mount ONLY if microphone permission was already granted
     // for this origin, avoiding iframe gesture rejections and start/error flicker loops.
     if (navigator.permissions?.query) {
@@ -246,244 +104,11 @@ export function App() {
     }
     return () => {
       searchAbortRef.current?.abort();
-      batchAbortRef.current?.abort();
       stopDictation();
       stopCamera();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Clear cached product detail/evidence when shipping region/currency changes
-  useEffect(() => {
-    productInspectionCacheRef.current.clear();
-  }, [country, currency]);
-
-  // Run bounded-concurrency (max 2) spatial fit check across the first 5 real Shopify
-  // results whenever both search results and an active measured/spoken spatial limit exist,
-  // discarding stale runs when search, limit, or clearance changes.
-  const spatialLimitEffectKey = activeSpatialLimit
-    ? `${activeSpatialLimit.source}:${activeSpatialLimit.axis}:${activeSpatialLimit.minMm.toFixed(2)}:${activeSpatialLimit.maxMm.toFixed(2)}:${activeSpatialLimit.clearanceInches.toFixed(2)}`
-    : null;
-
-  useEffect(() => {
-    batchRunIdRef.current += 1;
-    const currentRunId = batchRunIdRef.current;
-    batchAbortRef.current?.abort();
-
-    if (
-      !activeSpatialLimit ||
-      !searchResult ||
-      searchResult.products.length === 0
-    ) {
-      setBatchFitByProductId({});
-      setBatchChecking(false);
-      return;
-    }
-
-    const limitSnapshot = activeSpatialLimit;
-    const controller = new AbortController();
-    batchAbortRef.current = controller;
-
-    const targetProducts = searchResult.products.slice(0, BATCH_SHELF_CHECK_LIMIT);
-    const activeConstraintsSnapshot = interpretation?.activeConstraints ?? [];
-    const maxPriceSnapshot =
-      interpretation?.maxPriceUsd ??
-      (maxPriceInput.trim() && Number(maxPriceInput) > 0
-        ? Number(maxPriceInput)
-        : null);
-    const spatialSnapshot = interpretation?.sceneSummary ?? null;
-
-    const initialMap: Record<string, BatchShelfFitEntry> = {};
-    const uncachedProducts: NormalizedProduct[] = [];
-
-    for (const prod of targetProducts) {
-      const cacheKey = `${country}:${currency}:${prod.id}`;
-      const cached = productInspectionCacheRef.current.get(cacheKey);
-      if (cached) {
-        const docDim = extractSelectedVariantDimension(
-          cached.productDetail,
-          cached.neonEvidence,
-          limitSnapshot.axis,
-        );
-        const fitEval = evaluateSpatialLimitFit({
-          limit: limitSnapshot,
-          documentedDimension: docDim,
-        });
-        initialMap[prod.id] = {
-          productId: prod.id,
-          variantId: cached.productDetail.primaryVariant?.id ?? null,
-          status: "ready",
-          productDetail: cached.productDetail,
-          neonEvidence: cached.neonEvidence,
-          fitEvaluation: fitEval,
-        };
-      } else {
-        initialMap[prod.id] = {
-          productId: prod.id,
-          variantId: prod.primaryVariant?.id ?? null,
-          status: "pending",
-          productDetail: null,
-          neonEvidence: null,
-          fitEvaluation: null,
-        };
-        uncachedProducts.push(prod);
-      }
-    }
-
-    setBatchFitByProductId(initialMap);
-
-    if (uncachedProducts.length === 0) {
-      setBatchChecking(false);
-      return;
-    }
-
-    setBatchChecking(true);
-
-    void runBoundedVerificationBatch({
-      items: uncachedProducts,
-      maxConcurrent: MAX_CONCURRENT_SHELF_CHECKS,
-      runId: currentRunId,
-      getCurrentRunId: () => batchRunIdRef.current,
-      signal: controller.signal,
-      worker: async (prod, _idx, signal): Promise<BatchShelfFitEntry> => {
-        try {
-          // 1. Fetch full selected-variant details & gallery photos via Shop MCP get_product
-          let detailedProduct = prod;
-          try {
-            const detailRes = await safeFetchJson<GetProductResult>(
-              "/api/shop/product",
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  id: prod.id,
-                  country,
-                  currency,
-                  selected:
-                    prod.selectedOptions.length > 0
-                      ? prod.selectedOptions
-                      : undefined,
-                }),
-                signal,
-              },
-            );
-            detailedProduct = detailRes.product;
-          } catch (detailErr) {
-            if (detailErr instanceof Error && detailErr.name === "AbortError") {
-              throw detailErr;
-            }
-          }
-
-          // 2. Inspect product photos & listing specs with Gemini 4 Neon if the matching
-          //    dimension is not already documented in variant options or listing text.
-          let neonEvidence: ProductEvidenceResult | null = null;
-          const prelimDim = extractSelectedVariantDimension(
-            detailedProduct,
-            null,
-            limitSnapshot.axis,
-          );
-          if (!prelimDim) {
-            try {
-              neonEvidence = await safeFetchJson<ProductEvidenceResult>(
-                "/api/shop/product/evidence",
-                {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    product: detailedProduct,
-                    activeConstraints: activeConstraintsSnapshot,
-                    maxPriceUsd: maxPriceSnapshot,
-                    spatialSummary: spatialSnapshot,
-                  }),
-                  signal,
-                },
-              );
-            } catch (evErr) {
-              if (evErr instanceof Error && evErr.name === "AbortError") {
-                throw evErr;
-              }
-            }
-          }
-
-          const documentedDim = extractSelectedVariantDimension(
-            detailedProduct,
-            neonEvidence,
-            limitSnapshot.axis,
-          );
-          const fitEvaluation = evaluateSpatialLimitFit({
-            limit: limitSnapshot,
-            documentedDimension: documentedDim,
-          });
-
-          const cacheKey = `${country}:${currency}:${prod.id}`;
-          productInspectionCacheRef.current.set(cacheKey, {
-            productDetail: detailedProduct,
-            neonEvidence,
-          });
-
-          return {
-            productId: prod.id,
-            variantId: detailedProduct.primaryVariant?.id ?? null,
-            status: "ready",
-            productDetail: detailedProduct,
-            neonEvidence,
-            fitEvaluation,
-          };
-        } catch (err) {
-          if (err instanceof Error && err.name === "AbortError") {
-            throw err;
-          }
-          const fallbackDim = extractSelectedVariantDimension(
-            prod,
-            null,
-            limitSnapshot.axis,
-          );
-          return {
-            productId: prod.id,
-            variantId: prod.primaryVariant?.id ?? null,
-            status: "error",
-            productDetail: prod,
-            neonEvidence: null,
-            fitEvaluation: evaluateSpatialLimitFit({
-              limit: limitSnapshot,
-              documentedDimension: fallbackDim,
-            }),
-            errorMessage:
-              err instanceof Error ? err.message : "Could not verify product dimension.",
-          };
-        }
-      },
-      onItemResolved: (entry) => {
-        if (batchRunIdRef.current !== currentRunId || controller.signal.aborted) {
-          return;
-        }
-        setBatchFitByProductId((prev) => ({
-          ...prev,
-          [entry.productId]: entry,
-        }));
-      },
-    })
-      .catch(() => {
-        // Ignore AbortError from cancelled stale runs
-      })
-      .finally(() => {
-        if (batchRunIdRef.current === currentRunId && !controller.signal.aborted) {
-          setBatchChecking(false);
-        }
-      });
-
-    return () => {
-      controller.abort();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    spatialLimitEffectKey,
-    searchResult,
-    country,
-    currency,
-    interpretation,
-    maxPriceInput,
-  ]);
 
   function getMaxPriceMinor(rawPrice: string, curr: string): number | undefined {
     const num = Number(rawPrice);
@@ -503,12 +128,9 @@ export function App() {
       return;
     }
 
-    const catalogQuery = stripSpokenDimensionPhrase(activeQuery);
-
+    // Abort superseded in-flight searches
     if (!options.append) {
       searchAbortRef.current?.abort();
-      batchRunIdRef.current += 1;
-      batchAbortRef.current?.abort();
     }
     const controller = new AbortController();
     searchAbortRef.current = controller;
@@ -530,7 +152,7 @@ export function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          query: catalogQuery,
+          query: activeQuery,
           country,
           currency,
           availableOnly,
@@ -565,7 +187,7 @@ export function App() {
 
   function handleSearchSubmit(e: FormEvent) {
     e.preventDefault();
-    void runSearch();
+    runSearch();
   }
 
   useEffect(() => {
@@ -573,11 +195,11 @@ export function App() {
   }, [rambleText]);
 
   useEffect(() => {
-    if (cameraActive && !frozenFrame && videoRef.current && cameraStreamRef.current) {
+    if (cameraActive && videoRef.current && cameraStreamRef.current) {
       videoRef.current.srcObject = cameraStreamRef.current;
       videoRef.current.play().catch(() => {});
     }
-  }, [cameraActive, frozenFrame, spaceOpen]);
+  }, [cameraActive, spaceOpen]);
 
   function sampleCurrentVideoFrame(): string | null {
     const video = videoRef.current;
@@ -600,91 +222,22 @@ export function App() {
     return base64;
   }
 
-  function freezeLiveFrameForCalibration() {
-    setCameraError(null);
-    const video = videoRef.current;
-    if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
-      setCameraError(
-        "Waiting for live video stream to initialize a frame—tap Freeze Frame again in a moment.",
-      );
-      return;
-    }
-
-    const targetWidth = Math.min(video.videoWidth, 1280);
-    const targetHeight =
-      Math.round((video.videoHeight / video.videoWidth) * targetWidth) || 720;
-    const canvas = document.createElement("canvas");
-    canvas.width = targetWidth;
-    canvas.height = targetHeight;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      setCameraError("Could not capture camera frame onto calibration canvas.");
-      return;
-    }
-
-    ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
-    const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
-    setShelfCalibration(null);
-    setMeasurementSkipped(false);
-    setAwaitingMeasureFreeze(false);
-    setFrozenFrame({
-      dataUrl,
-      width: targetWidth,
-      height: targetHeight,
-    });
-  }
-
-  function handleMeasureThisSpace() {
-    setInspectedProduct(null);
-    setSpaceOpen(true);
-    setFitManuallyRequested(true);
-    setMeasurementSkipped(false);
-
-    if (cameraActive && videoRef.current && videoRef.current.videoWidth > 0) {
-      freezeLiveFrameForCalibration();
-      return;
-    }
-
-    setAwaitingMeasureFreeze(true);
-    if (!cameraActive) {
-      void startCamera(facingMode, true);
-    }
-  }
-
-  function handleSkipMeasurement() {
-    setFrozenFrame(null);
-    setShelfCalibration(null);
-    setAwaitingMeasureFreeze(false);
-    setMeasurementSkipped(true);
-  }
-
-  function handleRetakeCalibrationFrame() {
-    setFrozenFrame(null);
-    setShelfCalibration(null);
-    setAwaitingMeasureFreeze(true);
-    if (!cameraActive) {
-      void startCamera(facingMode, true);
-    }
-  }
-
-  // Continuous 1 FPS live video stream sampler while camera is active and not frozen
+  // Continuous 1 FPS live video stream sampler while camera is active
   useEffect(() => {
-    if (!cameraActive || frozenFrame) {
-      if (!cameraActive) {
-        videoFramesRef.current = [];
-        setLiveFrameCount(0);
-      }
+    if (!cameraActive) {
+      videoFramesRef.current = [];
+      setLiveFrameCount(0);
       return;
     }
     const interval = window.setInterval(() => {
       sampleCurrentVideoFrame();
     }, 1000);
     return () => window.clearInterval(interval);
-  }, [cameraActive, frozenFrame]);
+  }, [cameraActive]);
 
   // Optional continuous Live Auto-Search sync from rolling 1 FPS video stream
   useEffect(() => {
-    if (!cameraActive || !liveAutoSync || frozenFrame) return;
+    if (!cameraActive || !liveAutoSync) return;
     const syncTimer = window.setInterval(() => {
       if (!interpretingRef.current && videoFramesRef.current.length > 0) {
         void handleInterpretAndSearch("live_auto_sync");
@@ -692,18 +245,12 @@ export function App() {
     }, 5000);
     return () => window.clearInterval(syncTimer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cameraActive, liveAutoSync, frozenFrame]);
+  }, [cameraActive, liveAutoSync]);
 
-  async function startCamera(
-    preferredFacing: "environment" | "user" = facingMode,
-    preserveMeasureIntent = false,
-  ) {
+  async function startCamera(preferredFacing: "environment" | "user" = facingMode) {
     setCameraError(null);
-    setFrozenFrame(null);
-    if (!preserveMeasureIntent) {
-      setAwaitingMeasureFreeze(false);
-    }
 
+    // Ensure auto-dictation starts on this user gesture if not already active
     if (!dictatingRef.current && !startingDictationRef.current) {
       void startAutoDictation(true);
     }
@@ -767,13 +314,12 @@ export function App() {
     videoFramesRef.current = [];
     setLiveFrameCount(0);
     setLiveAutoSync(false);
-    setAwaitingMeasureFreeze(false);
     setCameraActive(false);
   }
 
   function flipCamera() {
     const nextFacing = facingMode === "environment" ? "user" : "environment";
-    void startCamera(nextFacing, awaitingMeasureFreeze);
+    startCamera(nextFacing);
   }
 
   function stopDictation() {
@@ -862,6 +408,7 @@ export function App() {
         micStreamRef.current = openedMic;
         setMicStream(openedMic);
       } catch {
+        // If mic permission was denied, abort cleanly without flickering
         startingDictationRef.current = false;
         stopDictation();
         if (!silentIfUnsupported) {
@@ -913,6 +460,7 @@ export function App() {
       rambleTextRef.current = cleaned;
       setRambleText(cleaned);
 
+      // Automatically interpret & search when the user pauses speaking for 1.4s
       if (speechPauseTimerRef.current) {
         window.clearTimeout(speechPauseTimerRef.current);
       }
@@ -935,10 +483,13 @@ export function App() {
       const errCode = event.error || "unknown";
       lastSpeechErrorRef.current = errCode;
 
+      // Quiet silence timeout ('no-speech') is normal during continuous listening:
+      // keep the button & micStream steady so onend rolls over seamlessly without flicker.
       if (errCode === "no-speech" && autoDictateEnabledRef.current) {
         return;
       }
 
+      // Terminal permission, gesture, or hardware errors must halt auto-restart immediately
       if (
         errCode === "not-allowed" ||
         errCode === "service-not-allowed" ||
@@ -964,6 +515,7 @@ export function App() {
         return;
       }
 
+      // Guard against rapid start->end failure loops (< 1200ms without 'no-speech')
       const elapsedMs = Date.now() - dictationStartedAtRef.current;
       if (elapsedMs < 1200 && lastSpeechErrorRef.current !== "no-speech") {
         consecutiveQuickEndsRef.current += 1;
@@ -976,6 +528,7 @@ export function App() {
         return;
       }
 
+      // Seamless rollover restart without toggling dictating false -> true
       if (dictationRestartTimerRef.current) {
         window.clearTimeout(dictationRestartTimerRef.current);
       }
@@ -1017,12 +570,10 @@ export function App() {
   async function handleInterpretAndSearch(
     triggerSource: DecisionTriggerSource = "manual_submit",
   ) {
-    if (cameraActive && !frozenFrame) {
+    if (cameraActive) {
       sampleCurrentVideoFrame();
     }
-    const framesToSend = frozenFrame
-      ? [frozenFrame.dataUrl.split(",")[1] || ""].filter(Boolean)
-      : [...videoFramesRef.current];
+    const framesToSend = [...videoFramesRef.current];
     const currentText = rambleTextRef.current.trim();
 
     if (!currentText && framesToSend.length === 0) {
@@ -1099,15 +650,13 @@ export function App() {
       /\$|\b(under|below|max|budget)\b/i.test(removed.text);
     const nextMaxUsd = removedLooksLikePrice ? null : current.maxPriceUsd;
 
+    // Strip the relaxed constraint token from the search query when present
     const strippedWords = removed.text
       .replace(/^(no|without|under|below)\s+/i, "")
       .trim();
     const escaped = strippedWords.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const nextQueryCandidate = escaped
-      ? current.searchQuery
-          .replace(new RegExp(`\\b${escaped}\\b`, "ig"), "")
-          .replace(/\s{2,}/g, " ")
-          .trim()
+      ? current.searchQuery.replace(new RegExp(`\\b${escaped}\\b`, "ig"), "").replace(/\s{2,}/g, " ").trim()
       : current.searchQuery;
     const finalQuery = nextQueryCandidate || current.searchQuery;
 
@@ -1134,24 +683,6 @@ export function App() {
         minute: "2-digit",
         second: "2-digit",
       })
-    : null;
-
-  const displayedProducts = searchResult
-    ? orderProductsForViewMode({
-        products: searchResult.products,
-        entriesByProductId: batchFitByProductId,
-        viewMode: activeSpatialLimit ? resultViewMode : "standard",
-        checkedLimit: BATCH_SHELF_CHECK_LIMIT,
-      })
-    : [];
-
-  const originalIndexByProductId = new Map<string, number>();
-  searchResult?.products.forEach((p, idx) => {
-    originalIndexByProductId.set(p.id, idx);
-  });
-
-  const inspectedPrecomputedEvidence = inspectedProduct
-    ? batchFitByProductId[inspectedProduct.id]?.neonEvidence ?? null
     : null;
 
   return (
@@ -1196,7 +727,7 @@ export function App() {
           <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
             <div className="max-w-2xl">
               <p className="text-xs font-medium uppercase tracking-widest text-[#57534E] mb-2">
-                Shop MCP · Live Camera &amp; Voice Discovery
+                Shop MCP · Stateless Catalog Discovery
               </p>
               <h1 className="font-display text-3xl sm:text-4xl font-medium text-[#18181B] leading-tight text-balance">
                 Search products from millions of Shopify merchants.
@@ -1213,140 +744,74 @@ export function App() {
             </button>
           </div>
 
-          {/* Live Video, Optional Measure-This-Space & Voice Stream Panel */}
+          {/* Live Video & Voice Stream Panel */}
           {spaceOpen && (
             <div className="bg-white rounded-xl border border-[#E7E5E0] p-5 grid grid-cols-1 lg:grid-cols-12 gap-6">
               <div className="lg:col-span-5 space-y-3">
-                {frozenFrame ? (
-                  <ShelfCalibrationPanel
-                    frozenFrame={frozenFrame}
-                    calibration={shelfCalibration}
-                    clearanceInches={clearanceInches}
-                    suggestedAxis={fitIntent.suggestedAxis}
-                    contextHintText={`${rambleText} ${query}`}
-                    onClearanceChange={setClearanceInches}
-                    onCalibrationChange={(cal) => {
-                      setShelfCalibration(cal);
-                      if (cal) {
-                        setMeasurementSkipped(false);
-                        setResultViewMode("scenecart");
-                      }
-                    }}
-                    onRetake={handleRetakeCalibrationFrame}
-                    onSkipMeasurement={handleSkipMeasurement}
+                <div className="relative aspect-video rounded-lg overflow-hidden bg-[#18181B] border border-[#E7E5E0]">
+                  <video
+                    ref={videoRef}
+                    playsInline
+                    muted
+                    autoPlay
+                    className={
+                      cameraActive
+                        ? "w-full h-full object-cover"
+                        : "hidden"
+                    }
                   />
-                ) : (
-                  <>
-                    <div className="relative aspect-video rounded-lg overflow-hidden bg-[#18181B] border border-[#E7E5E0]">
-                      <video
-                        ref={videoRef}
-                        playsInline
-                        muted
-                        autoPlay
-                        className={
-                          cameraActive ? "w-full h-full object-cover" : "hidden"
-                        }
-                      />
-                      {cameraActive ? (
-                        <div className="absolute top-2.5 left-2.5 px-2.5 py-1 rounded-md bg-black/75 text-white text-[11px] font-mono-tabular flex items-center gap-1.5">
-                          <span className="w-2 h-2 rounded-full bg-[#EF4444] animate-pulse" />
-                          <span>LIVE VIDEO · 1 FPS ({liveFrameCount}f window)</span>
-                        </div>
-                      ) : (
-                        <div className="w-full h-full flex flex-col items-center justify-center text-[#A8A29E] px-4 text-center">
-                          <Video className="w-7 h-7 mb-2 opacity-70" />
-                          <p className="text-xs">
-                            Pan your room and talk naturally to shop any category, or tap Measure this space when checking physical fit.
-                          </p>
-                        </div>
-                      )}
+                  {cameraActive ? (
+                    <div className="absolute top-2.5 left-2.5 px-2.5 py-1 rounded-md bg-black/75 text-white text-[11px] font-mono-tabular flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-[#EF4444] animate-pulse" />
+                      <span>LIVE VIDEO · 1 FPS ({liveFrameCount}f window)</span>
                     </div>
+                  ) : (
+                    <div className="w-full h-full flex flex-col items-center justify-center text-[#A8A29E] px-4 text-center">
+                      <Video className="w-7 h-7 mb-2 opacity-70" />
+                      <p className="text-xs">
+                        Start live video to stream your space continuously at 1 FPS while you talk.
+                      </p>
+                    </div>
+                  )}
+                </div>
 
-                    {awaitingMeasureFreeze && (
-                      <div
-                        data-testid="awaiting-measure-banner"
-                        className="rounded-lg border border-[#E7E5E0] bg-[#FAF9F6] px-3 py-2 text-xs text-[#18181B] flex flex-wrap items-center justify-between gap-2"
-                      >
-                        <span>
-                          Place an 85.60 × 53.98 mm card flat along your span, then tap Freeze Frame.
-                        </span>
-                        <button
-                          type="button"
-                          onClick={handleSkipMeasurement}
-                          className="underline underline-offset-2 text-[#57534E] hover:text-[#18181B] whitespace-nowrap"
-                        >
-                          Skip measurement
-                        </button>
-                      </div>
-                    )}
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => (cameraActive ? stopCamera() : startCamera())}
+                    className="min-h-[40px] px-3.5 py-2 rounded-lg bg-[#18181B] text-white text-xs font-medium flex items-center gap-1.5"
+                  >
+                    {cameraActive ? <VideoOff className="w-3.5 h-3.5" /> : <Video className="w-3.5 h-3.5" />}
+                    <span>{cameraActive ? "Stop Live Video" : "Start Live Video"}</span>
+                  </button>
 
-                    <div className="flex flex-wrap items-center gap-2">
+                  {cameraActive && (
+                    <>
                       <button
                         type="button"
-                        onClick={() => (cameraActive ? stopCamera() : void startCamera())}
-                        className="min-h-[40px] px-3.5 py-2 rounded-lg bg-[#18181B] text-white text-xs font-medium flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                        onClick={flipCamera}
+                        aria-label="Flip camera"
+                        className="min-h-[40px] px-3 py-2 rounded-lg border border-[#E7E5E0] bg-white text-[#18181B] text-xs font-medium hover:border-[#18181B] flex items-center gap-1"
                       >
-                        {cameraActive ? (
-                          <VideoOff className="w-3.5 h-3.5" />
-                        ) : (
-                          <Video className="w-3.5 h-3.5" />
-                        )}
-                        <span>{cameraActive ? "Stop Live Video" : "Start Live Video"}</span>
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        <span>Flip Camera</span>
                       </button>
 
                       <button
                         type="button"
-                        data-testid="measure-space-btn"
-                        onClick={() =>
-                          cameraActive
-                            ? freezeLiveFrameForCalibration()
-                            : handleMeasureThisSpace()
-                        }
-                        className={`min-h-[40px] px-3.5 py-2 rounded-lg text-xs font-medium flex items-center gap-1.5 whitespace-nowrap shrink-0 transition-colors ${
-                          cameraActive || awaitingMeasureFreeze
-                            ? "bg-[#1F4E3D] text-white hover:bg-[#173B2E]"
-                            : "border border-[#E7E5E0] bg-white text-[#18181B] hover:border-[#18181B]"
+                        onClick={() => setLiveAutoSync((v) => !v)}
+                        className={`min-h-[40px] px-3 py-2 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition-colors ${
+                          liveAutoSync
+                            ? "border-[#1F4E3D] bg-[#1F4E3D] text-white"
+                            : "border-[#E7E5E0] bg-white text-[#18181B] hover:border-[#18181B]"
                         }`}
                       >
-                        <Ruler className="w-3.5 h-3.5" />
-                        <span>
-                          {cameraActive && awaitingMeasureFreeze
-                            ? "Freeze Frame"
-                            : "Measure this space"}
-                        </span>
+                        <Radio className="w-3.5 h-3.5" />
+                        <span>{liveAutoSync ? "Live Auto-Sync: ON" : "Live Auto-Sync: OFF"}</span>
                       </button>
-
-                      {cameraActive && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={flipCamera}
-                            aria-label="Flip camera"
-                            className="min-h-[40px] px-3 py-2 rounded-lg border border-[#E7E5E0] bg-white text-[#18181B] text-xs font-medium hover:border-[#18181B] flex items-center gap-1 whitespace-nowrap shrink-0"
-                          >
-                            <RefreshCw className="w-3.5 h-3.5" />
-                            <span>Flip</span>
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => setLiveAutoSync((v) => !v)}
-                            className={`min-h-[40px] px-3 py-2 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
-                              liveAutoSync
-                                ? "border-[#1F4E3D] bg-[#1F4E3D] text-white"
-                                : "border-[#E7E5E0] bg-white text-[#18181B] hover:border-[#18181B]"
-                            }`}
-                          >
-                            <Radio className="w-3.5 h-3.5" />
-                            <span>
-                              {liveAutoSync ? "Live Auto-Sync: ON" : "Live Auto-Sync: OFF"}
-                            </span>
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  </>
-                )}
+                    </>
+                  )}
+                </div>
 
                 {cameraError && (
                   <p className="text-xs text-[#991B1B]">{cameraError}</p>
@@ -1356,11 +821,8 @@ export function App() {
               <div className="lg:col-span-7 flex flex-col justify-between gap-4">
                 <div className="space-y-3">
                   <div className="flex items-center justify-between gap-2">
-                    <label
-                      htmlFor="space-ramble"
-                      className="text-sm font-semibold text-[#18181B]"
-                    >
-                      Talk to your space
+                    <label htmlFor="space-ramble" className="text-sm font-semibold text-[#18181B]">
+                      Describe what fits your space
                     </label>
                     <DictationButton
                       dictating={dictating}
@@ -1373,105 +835,9 @@ export function App() {
                     rows={2}
                     value={rambleText}
                     onChange={(e) => setRambleText(e.target.value)}
-                    placeholder="Speak freely across any category—or say “at most 20 inches wide” to set a size limit directly."
+                    placeholder="Speak freely while panning your camera—auto-dictation transcribes and searches when you pause."
                     className="w-full rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] px-3.5 py-2.5 text-sm focus:bg-white focus:outline-none focus:border-[#1F4E3D]"
                   />
-
-                  {/* Contextual Measure-This-Space Offer when shopper asks about physical fit without a spoken limit */}
-                  {showMeasureSpaceOffer && (
-                    <div
-                      data-testid="measure-space-offer"
-                      className="rounded-lg border border-[#E7E5E0] bg-[#FAF9F6] p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
-                    >
-                      <div className="space-y-0.5">
-                        <p className="font-semibold text-[#18181B]">
-                          Check physical fit for this space?
-                        </p>
-                        <p className="text-[#57534E]">
-                          Measure your desk gap, wall width, or shelf opening—or say a limit like &ldquo;at most 20 inches wide.&rdquo;
-                        </p>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <button
-                          type="button"
-                          data-testid="offer-measure-space-btn"
-                          onClick={handleMeasureThisSpace}
-                          className="min-h-[36px] px-3 py-1.5 rounded-lg bg-[#1F4E3D] text-white font-medium hover:bg-[#173B2E] flex items-center gap-1.5 whitespace-nowrap"
-                        >
-                          <Ruler className="w-3.5 h-3.5" />
-                          <span>Measure this space</span>
-                        </button>
-                        <button
-                          type="button"
-                          data-testid="offer-skip-measurement-btn"
-                          onClick={handleSkipMeasurement}
-                          className="min-h-[36px] px-3 py-1.5 rounded-lg border border-[#E7E5E0] bg-white text-[#57534E] hover:text-[#18181B] hover:border-[#18181B] font-medium whitespace-nowrap"
-                        >
-                          Skip measurement
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Active Spoken Limit Banner (Card step skipped) */}
-                  {activeSpokenLimit && !measuredSpatialLimit && (
-                    <div
-                      data-testid="active-spoken-limit-banner"
-                      className="rounded-lg border border-[#E7E5E0] bg-[#FAF9F6] px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs"
-                    >
-                      <span className="text-[#18181B] flex items-center gap-1.5">
-                        <CheckCircle2 className="w-4 h-4 text-[#14532D] shrink-0" />
-                        <span>
-                          Using spoken {activeSpokenLimit.axis} limit:{" "}
-                          <span className="font-mono-tabular font-semibold">
-                            ≤ {activeSpokenLimit.maxInches.toFixed(1)} in (
-                            {Math.round(activeSpokenLimit.maxMm)} mm)
-                          </span>{" "}
-                          · Card step skipped
-                        </span>
-                      </span>
-                      <div className="flex items-center gap-3">
-                        <button
-                          type="button"
-                          onClick={handleMeasureThisSpace}
-                          className="underline underline-offset-2 text-[#57534E] hover:text-[#18181B] whitespace-nowrap"
-                        >
-                          Measure with card instead
-                        </button>
-                        <button
-                          type="button"
-                          aria-label="Clear spoken size limit"
-                          onClick={() => setDismissedSpokenKey(rawSpokenKey)}
-                          className="text-[#57534E] hover:text-[#18181B] inline-flex items-center gap-1 whitespace-nowrap"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                          <span>Clear</span>
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Skipped Measurement Status (Fit unknown) */}
-                  {showSkippedFitUnknown && (
-                    <div
-                      data-testid="skipped-measurement-banner"
-                      className="rounded-lg border border-[#E7E5E0] bg-[#FAF9F6] px-3.5 py-2 flex flex-wrap items-center justify-between gap-2 text-xs text-[#57534E]"
-                    >
-                      <span className="flex items-center gap-1.5">
-                        <HelpCircle className="w-3.5 h-3.5 shrink-0" />
-                        <span>
-                          <strong className="font-semibold text-[#18181B]">Fit unknown</strong> · Measurement skipped; shopping continues normally.
-                        </span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={handleMeasureThisSpace}
-                        className="underline underline-offset-2 text-[#18181B] hover:text-[#1F4E3D] font-medium whitespace-nowrap"
-                      >
-                        Measure this space
-                      </button>
-                    </div>
-                  )}
 
                   <DecisionStatusPanel
                     decision={latestDecision}
@@ -1488,7 +854,7 @@ export function App() {
                           type="button"
                           onClick={() => {
                             setQuery(rambleText.trim());
-                            void runSearch(rambleText.trim());
+                            runSearch(rambleText.trim());
                           }}
                           className="px-2.5 py-1.5 rounded bg-[#18181B] text-white text-xs font-medium whitespace-nowrap shrink-0 self-start sm:self-auto"
                         >
@@ -1503,7 +869,7 @@ export function App() {
                   type="button"
                   onClick={() => void handleInterpretAndSearch("manual_submit")}
                   disabled={interpreting}
-                  className="min-h-[44px] px-4 py-2.5 rounded-lg bg-[#1F4E3D] text-white text-xs font-medium hover:bg-[#173B2E] disabled:opacity-60 flex items-center justify-center gap-2 self-start whitespace-nowrap"
+                  className="min-h-[44px] px-4 py-2.5 rounded-lg bg-[#1F4E3D] text-white text-xs font-medium hover:bg-[#173B2E] disabled:opacity-60 flex items-center justify-center gap-2 self-start"
                 >
                   <Sparkles className="w-3.5 h-3.5" />
                   <span>
@@ -1586,9 +952,9 @@ export function App() {
                     type="button"
                     onClick={() => {
                       setQuery(q);
-                      void runSearch(q);
+                      runSearch(q);
                     }}
-                    className="px-2.5 py-1 rounded border border-[#E7E5E0] bg-[#F7F6F3] hover:border-[#18181B] text-[#18181B] transition-colors whitespace-nowrap"
+                    className="px-2.5 py-1 rounded border border-[#E7E5E0] bg-[#F7F6F3] hover:border-[#18181B] text-[#18181B] transition-colors"
                   >
                     {q}
                   </button>
@@ -1608,7 +974,7 @@ export function App() {
           </form>
         </section>
 
-        {/* Search Results, Standard/SceneCart Toggle & Freshness Status */}
+        {/* Search Results & Freshness Status */}
         <section id="results" className="space-y-5">
           {searchError && (
             <div className="p-4 rounded-xl bg-[#FEF2F2] border border-[#FECACA] text-sm text-[#991B1B] flex items-start gap-3">
@@ -1631,88 +997,28 @@ export function App() {
             </div>
           )}
 
-          <div className="flex flex-wrap items-center justify-between gap-4 pb-3 border-b border-[#E7E5E0]">
-            <div className="space-y-1">
-              <h2 className="font-display text-2xl font-medium text-[#18181B]">
-                {searchResult
-                  ? `Results for “${searchResult.query}”`
-                  : "Catalog Results"}
-              </h2>
-              {activeSpatialLimit && (
-                <p
-                  data-testid="results-calibration-summary"
-                  className="text-xs font-mono-tabular text-[#57534E]"
-                >
-                  {activeSpatialLimit.source === "spoken"
-                    ? `Spoken ${activeSpatialLimit.axis} limit ≤ ${activeSpatialLimit.maxInches.toFixed(1)} in`
-                    : `${activeSpatialLimit.label} ${activeSpatialLimit.minInches.toFixed(1)}–${activeSpatialLimit.maxInches.toFixed(1)} in · +${activeSpatialLimit.clearanceInches.toFixed(2)} in clearance`}{" "}
-                  ·{" "}
-                  {batchChecking
-                    ? `Checking top ${BATCH_SHELF_CHECK_LIMIT} products (${MAX_CONCURRENT_SHELF_CHECKS} concurrent)...`
-                    : `Top ${Math.min(
-                        BATCH_SHELF_CHECK_LIMIT,
-                        searchResult?.products.length ?? 0,
-                      )} products checked`}
-                </p>
-              )}
-            </div>
-
-            <div className="flex flex-wrap items-center gap-4">
-              {activeSpatialLimit && searchResult && searchResult.products.length > 0 && (
-                <div
-                  role="tablist"
-                  aria-label="Ranking mode"
-                  data-testid="ranking-mode-toggle"
-                  className="flex items-center gap-1 p-1 rounded-lg bg-[#ECEAE4]"
-                >
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={resultViewMode === "standard"}
-                    data-testid="mode-standard-btn"
-                    onClick={() => setResultViewMode("standard")}
-                    className={`px-3 py-1.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 transition-colors ${
-                      resultViewMode === "standard"
-                        ? "bg-white text-[#18181B] shadow-xs"
-                        : "text-[#57534E] hover:text-[#18181B]"
-                    }`}
-                  >
-                    Standard
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={resultViewMode === "scenecart"}
-                    data-testid="mode-scenecart-btn"
-                    onClick={() => setResultViewMode("scenecart")}
-                    className={`px-3 py-1.5 rounded-md text-xs font-medium whitespace-nowrap shrink-0 transition-colors ${
-                      resultViewMode === "scenecart"
-                        ? "bg-white text-[#18181B] shadow-xs"
-                        : "text-[#57534E] hover:text-[#18181B]"
-                    }`}
-                  >
-                    SceneCart
-                  </button>
-                </div>
-              )}
-
-              {searchResult && (
-                <div className="flex items-center gap-3 text-xs font-mono-tabular text-[#57534E]">
-                  <span>
-                    Showing {searchResult.products.length}
-                    {searchResult.pagination.totalCount != null
-                      ? ` of ${searchResult.pagination.totalCount}`
-                      : ""}
+          <div className="flex flex-wrap items-baseline justify-between gap-2 pb-3 border-b border-[#E7E5E0]">
+            <h2 className="font-display text-2xl font-medium text-[#18181B]">
+              {searchResult
+                ? `Results for “${searchResult.query}”`
+                : "Catalog Results"}
+            </h2>
+            {searchResult && (
+              <div className="flex items-center gap-3 text-xs font-mono-tabular text-[#57534E]">
+                <span>
+                  Showing {searchResult.products.length}
+                  {searchResult.pagination.totalCount != null
+                    ? ` of ${searchResult.pagination.totalCount}`
+                    : ""}
+                </span>
+                {fetchedTimestamp && (
+                  <span className="flex items-center gap-1">
+                    <Clock className="w-3.5 h-3.5" />
+                    Fetched {fetchedTimestamp}
                   </span>
-                  {fetchedTimestamp && (
-                    <span className="flex items-center gap-1">
-                      <Clock className="w-3.5 h-3.5" />
-                      Fetched {fetchedTimestamp}
-                    </span>
-                  )}
-                </div>
-              )}
-            </div>
+                )}
+              </div>
+            )}
           </div>
 
           {searching ? (
@@ -1743,7 +1049,7 @@ export function App() {
           ) : (
             <>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-                {displayedProducts.map((product) => {
+                {searchResult?.products.map((product) => {
                   const v = product.primaryVariant;
                   const image = v?.media[0]?.url ?? product.media[0]?.url ?? "";
                   const alt =
@@ -1753,33 +1059,13 @@ export function App() {
                     .map((o) => `${o.name}: ${o.label}`)
                     .join(" · ");
 
-                  const origIdx = originalIndexByProductId.get(product.id) ?? 0;
-                  const isInTopFive = origIdx < BATCH_SHELF_CHECK_LIMIT;
-                  const fitEntry = activeSpatialLimit
-                    ? batchFitByProductId[product.id]
-                    : undefined;
-                  const fitVerdict: WidthFitVerdict | null = activeSpatialLimit
-                    ? fitEntry?.fitEvaluation?.verdict ?? null
-                    : showSkippedFitUnknown
-                      ? "Fit unknown"
-                      : null;
-                  const fitStyle = fitVerdict ? getCardFitVerdictStyle(fitVerdict) : null;
-                  const docDim = fitEntry?.fitEvaluation?.documentedWidth ?? null;
-                  const reqDim = fitEntry?.fitEvaluation?.requiredWidthInches ?? null;
-                  const clrUsed = fitEntry?.fitEvaluation?.clearanceInches ?? 0;
-
                   return (
                     <article
                       key={product.id}
-                      data-testid="product-result-card"
-                      data-product-id={product.id}
-                      data-original-rank={origIdx + 1}
                       className="bg-white rounded-xl border border-[#E7E5E0] overflow-hidden flex flex-col transition-transform duration-200 hover:-translate-y-0.5 hover:shadow-md"
                     >
                       <div
-                        onClick={() =>
-                          setInspectedProduct(fitEntry?.productDetail ?? product)
-                        }
+                        onClick={() => setInspectedProduct(product)}
                         className="aspect-[4/3] bg-[#ECEAE4] cursor-pointer overflow-hidden"
                       >
                         <ProductImage
@@ -1815,9 +1101,7 @@ export function App() {
                           <div className="flex items-baseline justify-between gap-3">
                             <button
                               type="button"
-                              onClick={() =>
-                                setInspectedProduct(fitEntry?.productDetail ?? product)
-                              }
+                              onClick={() => setInspectedProduct(product)}
                               className="text-left text-base font-semibold text-[#18181B] hover:underline underline-offset-2 line-clamp-2"
                             >
                               {product.title}
@@ -1832,68 +1116,12 @@ export function App() {
                               {optionSummary}
                             </p>
                           )}
-
-                          {/* Fit Check Summary on Checked Results or Skipped Measurement */}
-                          {(activeSpatialLimit || showSkippedFitUnknown) && (
-                            <div
-                              data-testid="card-shelf-fit-row"
-                              className="pt-2 border-t border-[#E7E5E0]/80 text-xs space-y-0.5"
-                            >
-                              {showSkippedFitUnknown && fitStyle ? (
-                                <div className="flex items-center justify-between gap-2">
-                                  <span
-                                    data-testid="card-shelf-fit-verdict"
-                                    className={`font-semibold flex items-center gap-1 ${fitStyle.textClass}`}
-                                  >
-                                    <fitStyle.Icon className="w-3.5 h-3.5 shrink-0" />
-                                    <span>Fit unknown</span>
-                                  </span>
-                                  <span className="text-[11px] font-mono-tabular text-[#78716C]">
-                                    Measurement skipped
-                                  </span>
-                                </div>
-                              ) : activeSpatialLimit && !isInTopFive ? (
-                                <p className="text-[#78716C] font-mono-tabular">
-                                  Shopify #{origIdx + 1} · Open details to check {activeSpatialLimit.axis} fit
-                                </p>
-                              ) : activeSpatialLimit &&
-                                (fitEntry?.status === "pending" || !fitEntry) ? (
-                                <p className="text-[#57534E] font-mono-tabular">
-                                  Shopify #{origIdx + 1} · Checking documented {activeSpatialLimit.axis}...
-                                </p>
-                              ) : fitVerdict && fitStyle ? (
-                                <>
-                                  <div className="flex items-center justify-between gap-2">
-                                    <span
-                                      data-testid="card-shelf-fit-verdict"
-                                      className={`font-semibold flex items-center gap-1 ${fitStyle.textClass}`}
-                                    >
-                                      <fitStyle.Icon className="w-3.5 h-3.5 shrink-0" />
-                                      <span>{fitVerdict}</span>
-                                    </span>
-                                    <span className="text-[11px] font-mono-tabular text-[#78716C]">
-                                      Shopify #{origIdx + 1}
-                                    </span>
-                                  </div>
-                                  <p className="text-[11px] font-mono-tabular text-[#57534E] truncate">
-                                    {docDim && reqDim !== null
-                                      ? clrUsed > 0
-                                        ? `${docDim.widthInches.toFixed(1)}" + ${clrUsed.toFixed(2)}" clr = ${reqDim.toFixed(1)}" (${docDim.sourceLabel})`
-                                        : `${docDim.widthInches.toFixed(1)}" (${docDim.sourceLabel})`
-                                      : `No documented ${activeSpatialLimit?.axis ?? "width"} in listing or photos`}
-                                  </p>
-                                </>
-                              ) : null}
-                            </div>
-                          )}
                         </div>
 
                         <div className="flex items-center gap-2 pt-2 border-t border-[#E7E5E0]">
                           <button
                             type="button"
-                            onClick={() =>
-                              setInspectedProduct(fitEntry?.productDetail ?? product)
-                            }
+                            onClick={() => setInspectedProduct(product)}
                             className="flex-1 min-h-[40px] py-2 px-3 rounded-lg bg-[#18181B] text-white text-xs font-medium hover:bg-[#27272A] transition-colors whitespace-nowrap"
                           >
                             Product Details
@@ -1923,7 +1151,7 @@ export function App() {
                     type="button"
                     disabled={loadingMore}
                     onClick={() =>
-                      void runSearch(searchResult.query, {
+                      runSearch(searchResult.query, {
                         cursor: searchResult.pagination.cursor ?? undefined,
                         append: true,
                       })
@@ -1942,7 +1170,7 @@ export function App() {
       <footer className="border-t border-[#E7E5E0] bg-white">
         <div className="max-w-[1320px] mx-auto px-5 sm:px-8 py-5 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-[#57534E]">
           <span>Ramble Cart · Powered by Shop MCP anonymous catalog search</span>
-          <span>Live metadata refreshed per request · Cart &amp; checkout pending next phase</span>
+          <span>Live metadata refreshed per request · Cart & checkout pending next phase</span>
         </div>
       </footer>
 
@@ -1958,11 +1186,6 @@ export function App() {
             : null)
         }
         spatialSummary={interpretation?.sceneSummary ?? null}
-        spatialLimit={activeSpatialLimit}
-        fitRequested={fitRequested}
-        fitAxis={fitIntent.suggestedAxis}
-        precomputedEvidence={inspectedPrecomputedEvidence}
-        onMeasureSpace={handleMeasureThisSpace}
         onClose={() => setInspectedProduct(null)}
       />
     </div>
