@@ -108,7 +108,11 @@ export function DictationButton({
           if (!prefersReducedMotion || now - lastFrameTime >= 90) {
             lastFrameTime = now;
 
-            if (audioCtx && audioCtx.state === "running") {
+            if (audioCtx && audioCtx.state === "suspended") {
+              void audioCtx.resume().catch(() => {});
+            }
+
+            if (audioCtx && audioCtx.state !== "closed") {
               analyser.getByteTimeDomainData(timeData);
               analyser.getByteFrequencyData(freqData);
 

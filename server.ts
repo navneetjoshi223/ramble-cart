@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 dotenv.config({ override: true });
+import http from "node:http";
 import path from "node:path";
 import express from "express";
 import { ZodError } from "zod";
@@ -12,6 +13,10 @@ import {
 import { interpretSpaceAndRamble } from "./server/geminiAgent.js";
 import { extractProductEvidenceWithNeon } from "./server/neonAgent.js";
 import { evaluateShoppingDecision } from "./server/decisionsAgent.js";
+import {
+  attachLiveTranscribeWebSocket,
+  LIVE_TRANSCRIBE_MODEL,
+} from "./server/liveTranscribe.js";
 import type {
   ActiveConstraint,
   DecisionTriggerSource,
@@ -96,6 +101,7 @@ async function startServer() {
       decisionsModel: "gemini-decision-1",
       intentModel: "gemini-4-hydrogen",
       spatialAndEvidenceModel: "gemini-4-neon",
+      liveTranscribeModel: LIVE_TRANSCRIBE_MODEL,
       hasGeminiKey: Boolean(process.env.GEMINI_API_KEY?.trim()),
     });
   });
@@ -376,7 +382,10 @@ async function startServer() {
     },
   );
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const httpServer = http.createServer(app);
+  attachLiveTranscribeWebSocket(httpServer, "/api/live/transcribe");
+
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Server listening on http://0.0.0.0:${PORT}`);
   });
 }

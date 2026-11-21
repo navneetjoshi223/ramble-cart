@@ -24,6 +24,11 @@ import { ProductDetailModal } from "./components/ProductDetailModal";
 import { DictationButton } from "./components/DictationButton";
 import { DecisionStatusPanel } from "./components/DecisionStatusPanel";
 import { safeFetchJson } from "./utils/safeFetchJson";
+import {
+  applyLiveTranscriptionChunk,
+  downsampleFloat32ToPcm16Base64,
+  type LiveTranscriptState,
+} from "./utils/pcmAudio";
 
 const SAMPLE_QUERIES = [
   "ceramic coffee dripper",
@@ -72,8 +77,6 @@ export function App() {
   const searchAbortRef = useRef<AbortController | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const startingDictationRef = useRef(false);
   const videoFramesRef = useRef<string[]>([]);
   const rambleTextRef = useRef("");
   const interpretationRef = useRef<SpaceQueryInterpretation | null>(null);
@@ -82,16 +85,29 @@ export function App() {
   const dictationRestartTimerRef = useRef<number | null>(null);
   const dictationStartedAtRef = useRef(0);
   const consecutiveQuickEndsRef = useRef(0);
-  const lastSpeechErrorRef = useRef<string | null>(null);
+  const liveFatalErrorRef = useRef(false);
+  const startingDictationRef = useRef(false);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const liveWsRef = useRef<WebSocket | null>(null);
+  const liveAudioCtxRef = useRef<AudioContext | null>(null);
+  const liveSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const liveProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const liveGainRef = useRef<GainNode | null>(null);
+  const liveSessionReadyRef = useRef(false);
+  const liveTranscriptRef = useRef<LiveTranscriptState>({
+    finalizedText: "",
+    interimText: "",
+    displayText: "",
+    replaceOnNextSpeech: false,
+  });
   const autoDictateEnabledRef = useRef(false);
   const dictatingRef = useRef(false);
   const interpretingRef = useRef(false);
-  const recognitionRef = useRef<{ start: () => void; stop: () => void } | null>(null);
 
   useEffect(() => {
     runSearch("ceramic coffee dripper");
     // Auto-start dictation on mount ONLY if microphone permission was already granted
-    // for this origin, avoiding iframe gesture rejections and start/error flicker loops.
+    // for this origin, avoiding iframe gesture rejections and permission prompts on load.
     if (navigator.permissions?.query) {
       navigator.permissions
         .query({ name: "microphone" as PermissionName })
@@ -104,7 +120,7 @@ export function App() {
     }
     return () => {
       searchAbortRef.current?.abort();
-      stopDictation();
+      stopDictation(false);
       stopCamera();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -250,7 +266,7 @@ export function App() {
   async function startCamera(preferredFacing: "environment" | "user" = facingMode) {
     setCameraError(null);
 
-    // Ensure auto-dictation starts on this user gesture if not already active
+    // Auto-start live voice dictation on this user gesture if not already active
     if (!dictatingRef.current && !startingDictationRef.current) {
       void startAutoDictation(true);
     }
@@ -322,246 +338,376 @@ export function App() {
     startCamera(nextFacing);
   }
 
-  function stopDictation() {
-    startingDictationRef.current = false;
+  function closeLiveTranscribeSocket() {
+    liveSessionReadyRef.current = false;
+    const ws = liveWsRef.current;
+    liveWsRef.current = null;
+    if (ws) {
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      try {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close();
+        }
+      } catch {
+        // ignore close errors
+      }
+    }
+  }
+
+  function teardownLiveAudioPipeline() {
+    if (liveProcessorRef.current) {
+      liveProcessorRef.current.onaudioprocess = null;
+      try {
+        liveProcessorRef.current.disconnect();
+      } catch {
+        // ignore disconnect errors
+      }
+      liveProcessorRef.current = null;
+    }
+    if (liveSourceRef.current) {
+      try {
+        liveSourceRef.current.disconnect();
+      } catch {
+        // ignore disconnect errors
+      }
+      liveSourceRef.current = null;
+    }
+    if (liveGainRef.current) {
+      try {
+        liveGainRef.current.disconnect();
+      } catch {
+        // ignore disconnect errors
+      }
+      liveGainRef.current = null;
+    }
+    if (liveAudioCtxRef.current) {
+      const ctx = liveAudioCtxRef.current;
+      liveAudioCtxRef.current = null;
+      ctx.close().catch(() => {});
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((track) => track.stop());
+      micStreamRef.current = null;
+    }
+    setMicStream(null);
+  }
+
+  function stopDictation(triggerPendingSearch = false) {
     autoDictateEnabledRef.current = false;
+    startingDictationRef.current = false;
+
     if (dictationRestartTimerRef.current) {
       window.clearTimeout(dictationRestartTimerRef.current);
       dictationRestartTimerRef.current = null;
     }
+
+    const hadPendingPauseSearch = speechPauseTimerRef.current !== null;
     if (speechPauseTimerRef.current) {
       window.clearTimeout(speechPauseTimerRef.current);
       speechPauseTimerRef.current = null;
     }
-    const activeRec = recognitionRef.current;
-    recognitionRef.current = null;
-    try {
-      activeRec?.stop();
-    } catch {
-      // ignore if already stopped
-    }
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach((t) => t.stop());
-      micStreamRef.current = null;
-    }
-    setMicStream(null);
+
+    closeLiveTranscribeSocket();
+    teardownLiveAudioPipeline();
+
     dictatingRef.current = false;
     setDictating(false);
+
+    if (triggerPendingSearch && hadPendingPauseSearch) {
+      liveTranscriptRef.current = {
+        ...liveTranscriptRef.current,
+        replaceOnNextSpeech: true,
+      };
+      const latest = rambleTextRef.current.trim();
+      if (
+        latest &&
+        latest !== lastAutoInterpretedTextRef.current &&
+        !interpretingRef.current
+      ) {
+        lastAutoInterpretedTextRef.current = latest;
+        void handleInterpretAndSearch("speech_pause");
+      }
+    }
+  }
+
+  function openLiveTranscribeSocket(silentIfUnsupported: boolean) {
+    closeLiveTranscribeSocket();
+    if (!autoDictateEnabledRef.current) return;
+
+    const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${wsProto}//${window.location.host}/api/live/transcribe`;
+    const ws = new WebSocket(wsUrl);
+    liveWsRef.current = ws;
+    liveFatalErrorRef.current = false;
+    dictationStartedAtRef.current = Date.now();
+
+    ws.onmessage = (event) => {
+      if (liveWsRef.current !== ws) return;
+      let msg: {
+        type?: string;
+        text?: string;
+        message?: string;
+      } | null = null;
+      try {
+        msg = JSON.parse(String(event.data)) as {
+          type?: string;
+          text?: string;
+          message?: string;
+        };
+      } catch {
+        return;
+      }
+      if (!msg || !msg.type) return;
+
+      if (msg.type === "ready") {
+        liveSessionReadyRef.current = true;
+        consecutiveQuickEndsRef.current = 0;
+        return;
+      }
+
+      if ((msg.type === "interim" || msg.type === "final") && typeof msg.text === "string") {
+        consecutiveQuickEndsRef.current = 0;
+        const nextState = applyLiveTranscriptionChunk(liveTranscriptRef.current, {
+          type: msg.type,
+          text: msg.text,
+        });
+        liveTranscriptRef.current = nextState;
+
+        if (!nextState.displayText) return;
+
+        rambleTextRef.current = nextState.displayText;
+        setRambleText(nextState.displayText);
+
+        // Automatically interpret & search when the user pauses speaking for 1.4s,
+        // and replace with the next utterance when they speak again.
+        if (speechPauseTimerRef.current) {
+          window.clearTimeout(speechPauseTimerRef.current);
+        }
+        speechPauseTimerRef.current = window.setTimeout(() => {
+          speechPauseTimerRef.current = null;
+          liveTranscriptRef.current = {
+            ...liveTranscriptRef.current,
+            replaceOnNextSpeech: true,
+          };
+          const latest = rambleTextRef.current.trim();
+          if (
+            latest &&
+            latest !== lastAutoInterpretedTextRef.current &&
+            !interpretingRef.current
+          ) {
+            lastAutoInterpretedTextRef.current = latest;
+            void handleInterpretAndSearch("speech_pause");
+          }
+        }, 1400);
+        return;
+      }
+
+      if (msg.type === "error") {
+        liveFatalErrorRef.current = true;
+        const errorText =
+          msg.message ||
+          "Live voice transcription encountered a server error. Type your request below.";
+        stopDictation(false);
+        if (!silentIfUnsupported) {
+          setInterpretError(errorText);
+        }
+      }
+    };
+
+    ws.onerror = () => {
+      // onclose handles reconnection or surfacing a connection failure
+    };
+
+    ws.onclose = () => {
+      if (liveWsRef.current !== ws) return;
+      liveWsRef.current = null;
+      liveSessionReadyRef.current = false;
+
+      if (!autoDictateEnabledRef.current || liveFatalErrorRef.current) {
+        return;
+      }
+
+      const elapsedMs = Date.now() - dictationStartedAtRef.current;
+      if (elapsedMs < 1500) {
+        consecutiveQuickEndsRef.current += 1;
+      } else {
+        consecutiveQuickEndsRef.current = 0;
+      }
+
+      if (consecutiveQuickEndsRef.current >= 3) {
+        stopDictation(false);
+        if (!silentIfUnsupported) {
+          setInterpretError(
+            "Could not connect to the live voice transcription stream. Check your connection or type below.",
+          );
+        }
+        return;
+      }
+
+      if (dictationRestartTimerRef.current) {
+        window.clearTimeout(dictationRestartTimerRef.current);
+      }
+      dictationRestartTimerRef.current = window.setTimeout(() => {
+        dictationRestartTimerRef.current = null;
+        if (!autoDictateEnabledRef.current) return;
+        openLiveTranscribeSocket(silentIfUnsupported);
+      }, 400);
+    };
   }
 
   async function startAutoDictation(silentIfUnsupported = false) {
     if (startingDictationRef.current) return;
+    if (!silentIfUnsupported) {
+      setInterpretError(null);
+    }
 
-    const SpeechRec =
-      (
-        window as unknown as {
-          SpeechRecognition?: new () => unknown;
-          webkitSpeechRecognition?: new () => unknown;
-        }
-      ).SpeechRecognition ||
-      (window as unknown as { webkitSpeechRecognition?: new () => unknown })
-        .webkitSpeechRecognition;
-
-    if (!SpeechRec) {
-      stopDictation();
+    if (
+      typeof window === "undefined" ||
+      !navigator.mediaDevices?.getUserMedia ||
+      typeof WebSocket === "undefined"
+    ) {
+      stopDictation(false);
       if (!silentIfUnsupported) {
         setInterpretError(
-          "Speech dictation is unavailable in this browser. Type your request below.",
+          "Live microphone streaming is unavailable in this browser context. Type your request below.",
         );
       }
       return;
     }
 
     startingDictationRef.current = true;
+    autoDictateEnabledRef.current = true;
+    consecutiveQuickEndsRef.current = 0;
+    liveFatalErrorRef.current = false;
 
-    if (dictationRestartTimerRef.current) {
-      window.clearTimeout(dictationRestartTimerRef.current);
-      dictationRestartTimerRef.current = null;
-    }
-
-    if (recognitionRef.current) {
-      const prevRec = recognitionRef.current;
-      recognitionRef.current = null;
+    try {
+      let stream: MediaStream;
       try {
-        prevRec.stop();
-      } catch {
-        // ignore if already stopped
-      }
-    }
-
-    // Open microphone stream BEFORE SpeechRecognition.start() so macOS/iOS audio unit
-    // initialization never interrupts an already-running SpeechRecognition session.
-    if (!micStreamRef.current && navigator.mediaDevices?.getUserMedia) {
-      try {
-        const openedMic = await navigator.mediaDevices.getUserMedia({
+        stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true,
+            channelCount: 1,
           },
           video: false,
         });
-        if (!startingDictationRef.current) {
-          openedMic.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        micStreamRef.current = openedMic;
-        setMicStream(openedMic);
       } catch {
-        // If mic permission was denied, abort cleanly without flickering
-        startingDictationRef.current = false;
-        stopDictation();
-        if (!silentIfUnsupported) {
-          setInterpretError(
-            "Microphone permission denied. Allow microphone access or type your request below.",
-          );
-        }
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: false,
+        });
+      }
+
+      // User may have clicked mute while the permission prompt was open
+      if (!autoDictateEnabledRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
         return;
       }
-    }
 
-    const rec = new SpeechRec() as {
-      continuous: boolean;
-      interimResults: boolean;
-      lang: string;
-      onstart: (() => void) | null;
-      onresult: (e: {
-        results: ArrayLike<{ isFinal?: boolean; 0: { transcript: string } }>;
-      }) => void;
-      onerror: (e: { error?: string }) => void;
-      onend: () => void;
-      start: () => void;
-      stop: () => void;
-    };
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = "en-US";
+      teardownLiveAudioPipeline();
+      micStreamRef.current = stream;
+      setMicStream(stream);
 
-    rec.onstart = () => {
-      if (recognitionRef.current !== rec) return;
-      startingDictationRef.current = false;
-      dictationStartedAtRef.current = Date.now();
-      lastSpeechErrorRef.current = null;
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext })
+          .webkitAudioContext;
+
+      if (!AudioCtx) {
+        throw new Error("Web Audio API is unavailable in this browser.");
+      }
+
+      let audioCtx: AudioContext;
+      try {
+        audioCtx = new AudioCtx({ sampleRate: 16000 });
+      } catch {
+        audioCtx = new AudioCtx();
+      }
+      liveAudioCtxRef.current = audioCtx;
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume().catch(() => {});
+      }
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      const silentGain = audioCtx.createGain();
+      silentGain.gain.value = 0;
+
+      processor.onaudioprocess = (audioEvent) => {
+        const activeWs = liveWsRef.current;
+        if (
+          !activeWs ||
+          activeWs.readyState !== WebSocket.OPEN ||
+          !liveSessionReadyRef.current
+        ) {
+          return;
+        }
+        const channelData = audioEvent.inputBuffer.getChannelData(0);
+        const pcmBase64 = downsampleFloat32ToPcm16Base64(
+          channelData,
+          audioCtx.sampleRate,
+          16000,
+        );
+        if (!pcmBase64) return;
+        try {
+          activeWs.send(JSON.stringify({ audio: pcmBase64 }));
+        } catch {
+          // ignore transient send errors
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(audioCtx.destination);
+
+      liveSourceRef.current = source;
+      liveProcessorRef.current = processor;
+      liveGainRef.current = silentGain;
+
+      // Mark current text to be replaced cleanly once the user speaks a new utterance
+      liveTranscriptRef.current = {
+        finalizedText: rambleTextRef.current,
+        interimText: "",
+        displayText: rambleTextRef.current,
+        replaceOnNextSpeech: Boolean(rambleTextRef.current.trim()),
+      };
+
       dictatingRef.current = true;
       setDictating(true);
-    };
 
-    rec.onresult = (event) => {
-      if (recognitionRef.current !== rec) return;
-      consecutiveQuickEndsRef.current = 0;
-
-      let text = "";
-      for (let i = 0; i < event.results.length; i++) {
-        text += event.results[i][0]?.transcript ?? "";
-      }
-      const cleaned = text.trim();
-      if (!cleaned) return;
-
-      rambleTextRef.current = cleaned;
-      setRambleText(cleaned);
-
-      // Automatically interpret & search when the user pauses speaking for 1.4s
-      if (speechPauseTimerRef.current) {
-        window.clearTimeout(speechPauseTimerRef.current);
-      }
-      speechPauseTimerRef.current = window.setTimeout(() => {
-        const latest = rambleTextRef.current.trim();
-        if (
-          latest &&
-          latest !== lastAutoInterpretedTextRef.current &&
-          !interpretingRef.current
-        ) {
-          lastAutoInterpretedTextRef.current = latest;
-          void handleInterpretAndSearch("speech_pause");
+      openLiveTranscribeSocket(silentIfUnsupported);
+    } catch (err) {
+      stopDictation(false);
+      if (!silentIfUnsupported) {
+        const errName = err instanceof Error ? err.name : "";
+        if (errName === "NotAllowedError" || errName === "PermissionDeniedError") {
+          setInterpretError(
+            "Microphone permission was denied. Allow microphone access for this site in your browser settings.",
+          );
+        } else if (errName === "NotFoundError" || errName === "DevicesNotFoundError") {
+          setInterpretError(
+            "No active microphone was detected. Check your system input device and try again.",
+          );
+        } else {
+          setInterpretError(
+            err instanceof Error
+              ? `Could not start voice dictation (${err.message}).`
+              : "Could not start voice dictation. Allow microphone access or type below.",
+          );
         }
-      }, 1400);
-    };
-
-    rec.onerror = (event) => {
-      if (recognitionRef.current !== rec) return;
+      }
+    } finally {
       startingDictationRef.current = false;
-      const errCode = event.error || "unknown";
-      lastSpeechErrorRef.current = errCode;
-
-      // Quiet silence timeout ('no-speech') is normal during continuous listening:
-      // keep the button & micStream steady so onend rolls over seamlessly without flicker.
-      if (errCode === "no-speech" && autoDictateEnabledRef.current) {
-        return;
-      }
-
-      // Terminal permission, gesture, or hardware errors must halt auto-restart immediately
-      if (
-        errCode === "not-allowed" ||
-        errCode === "service-not-allowed" ||
-        errCode === "audio-capture" ||
-        errCode === "language-not-supported" ||
-        errCode === "network"
-      ) {
-        stopDictation();
-        return;
-      }
-
-      if (!autoDictateEnabledRef.current) {
-        stopDictation();
-      }
-    };
-
-    rec.onend = () => {
-      if (recognitionRef.current !== rec) return;
-      startingDictationRef.current = false;
-
-      if (!autoDictateEnabledRef.current) {
-        stopDictation();
-        return;
-      }
-
-      // Guard against rapid start->end failure loops (< 1200ms without 'no-speech')
-      const elapsedMs = Date.now() - dictationStartedAtRef.current;
-      if (elapsedMs < 1200 && lastSpeechErrorRef.current !== "no-speech") {
-        consecutiveQuickEndsRef.current += 1;
-      } else {
-        consecutiveQuickEndsRef.current = 0;
-      }
-
-      if (consecutiveQuickEndsRef.current >= 2) {
-        stopDictation();
-        return;
-      }
-
-      // Seamless rollover restart without toggling dictating false -> true
-      if (dictationRestartTimerRef.current) {
-        window.clearTimeout(dictationRestartTimerRef.current);
-      }
-      dictationRestartTimerRef.current = window.setTimeout(() => {
-        dictationRestartTimerRef.current = null;
-        if (!autoDictateEnabledRef.current || recognitionRef.current !== rec) {
-          return;
-        }
-        try {
-          dictationStartedAtRef.current = Date.now();
-          rec.start();
-        } catch {
-          stopDictation();
-        }
-      }, 250);
-    };
-
-    recognitionRef.current = rec;
-    consecutiveQuickEndsRef.current = 0;
-    lastSpeechErrorRef.current = null;
-    autoDictateEnabledRef.current = true;
-
-    try {
-      dictationStartedAtRef.current = Date.now();
-      rec.start();
-    } catch {
-      stopDictation();
     }
   }
 
   function toggleDictation() {
     if (dictatingRef.current || dictating || startingDictationRef.current) {
-      stopDictation();
+      stopDictation(true);
       return;
     }
     void startAutoDictation(false);
@@ -834,7 +980,21 @@ export function App() {
                     id="space-ramble"
                     rows={2}
                     value={rambleText}
-                    onChange={(e) => setRambleText(e.target.value)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      rambleTextRef.current = val;
+                      liveTranscriptRef.current = {
+                        finalizedText: val,
+                        interimText: "",
+                        displayText: val,
+                        replaceOnNextSpeech: false,
+                      };
+                      setRambleText(val);
+                      if (speechPauseTimerRef.current) {
+                        window.clearTimeout(speechPauseTimerRef.current);
+                        speechPauseTimerRef.current = null;
+                      }
+                    }}
                     placeholder="Speak freely while panning your camera—auto-dictation transcribes and searches when you pause."
                     className="w-full rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] px-3.5 py-2.5 text-sm focus:bg-white focus:outline-none focus:border-[#1F4E3D]"
                   />
