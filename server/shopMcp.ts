@@ -642,11 +642,6 @@ export async function callShopMcpTool(
   }
 
   const fetchFn = options.fetchImpl ?? fetch;
-  const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  const combinedSignal = options.signal
-    ? AbortSignal.any([options.signal, timeoutSignal])
-    : timeoutSignal;
-
   const requestBody = {
     jsonrpc: "2.0",
     id: Date.now(),
@@ -662,62 +657,100 @@ export async function callShopMcpTool(
     },
   };
 
-  let response: Response;
-  try {
-    response = await fetchFn(SHOP_MCP_ENDPOINT, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
-        "Mcp-Method": "tools/call",
-        "Mcp-Name": toolName,
-      },
-      body: JSON.stringify(requestBody),
-      signal: combinedSignal,
-    });
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      throw new ShopMcpError("Search request was cancelled.", {
-        statusCode: 499,
-        code: "REQUEST_ABORTED",
+  const maxAttempts = options.fetchImpl ? 1 : 2;
+  let lastError: ShopMcpError | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    const combinedSignal = options.signal
+      ? AbortSignal.any([options.signal, timeoutSignal])
+      : timeoutSignal;
+
+    let response: Response;
+    let rawText: string;
+    try {
+      response = await fetchFn(SHOP_MCP_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+          "Mcp-Method": "tools/call",
+          "Mcp-Name": toolName,
+        },
+        body: JSON.stringify(requestBody),
+        signal: combinedSignal,
       });
+
+      if (response.status === 429) {
+        const retryAfterHeader = response.headers.get("retry-after");
+        const retryAfterSeconds = retryAfterHeader ? Number(retryAfterHeader) : undefined;
+        throw new ShopMcpError(
+          "Shop MCP rate limit reached (HTTP 429). Wait briefly before searching again.",
+          {
+            statusCode: 429,
+            code: "RATE_LIMITED",
+            retryAfterSeconds: Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
+          },
+        );
+      }
+
+      if (!response.ok) {
+        const upstreamErr = new ShopMcpError(
+          `Shop MCP returned HTTP ${response.status}.`,
+          {
+            statusCode: response.status >= 500 ? 502 : response.status,
+            code: "UPSTREAM_HTTP_ERROR",
+          },
+        );
+        if (response.status >= 500 && attempt < maxAttempts && !options.signal?.aborted) {
+          lastError = upstreamErr;
+          await new Promise((r) => setTimeout(r, 350));
+          continue;
+        }
+        throw upstreamErr;
+      }
+
+      rawText = await response.text();
+    } catch (err) {
+      if (err instanceof ShopMcpError) {
+        throw err;
+      }
+      if (options.signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
+        throw new ShopMcpError("Search request was cancelled.", {
+          statusCode: 499,
+          code: "REQUEST_ABORTED",
+        });
+      }
+      if (err instanceof Error && err.name === "TimeoutError") {
+        throw new ShopMcpError("Shop MCP request timed out. Please try again.", {
+          statusCode: 504,
+          code: "UPSTREAM_TIMEOUT",
+        });
+      }
+      const netErr = new ShopMcpError(
+        err instanceof Error ? `Network error reaching Shop MCP: ${err.message}` : "Network error",
+        { statusCode: 502, code: "NETWORK_ERROR" },
+      );
+      if (attempt < maxAttempts && !options.signal?.aborted) {
+        lastError = netErr;
+        await new Promise((r) => setTimeout(r, 350));
+        continue;
+      }
+      throw netErr;
     }
-    if (err instanceof Error && err.name === "TimeoutError") {
-      throw new ShopMcpError("Shop MCP request timed out. Please try again.", {
-        statusCode: 504,
-        code: "UPSTREAM_TIMEOUT",
-      });
-    }
-    throw new ShopMcpError(
-      err instanceof Error ? `Network error reaching Shop MCP: ${err.message}` : "Network error",
-      { statusCode: 502, code: "NETWORK_ERROR" },
-    );
+
+    const parsedRpc = parseMcpResponseBody(rawText, response.headers.get("content-type"));
+    return extractToolStructuredContent(parsedRpc);
   }
 
-  if (response.status === 429) {
-    const retryAfterHeader = response.headers.get("retry-after");
-    const retryAfterSeconds = retryAfterHeader ? Number(retryAfterHeader) : undefined;
-    throw new ShopMcpError(
-      "Shop MCP rate limit reached (HTTP 429). Wait briefly before searching again.",
-      {
-        statusCode: 429,
-        code: "RATE_LIMITED",
-        retryAfterSeconds: Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
-      },
-    );
-  }
-
-  if (!response.ok) {
-    throw new ShopMcpError(`Shop MCP returned HTTP ${response.status}.`, {
-      statusCode: response.status >= 500 ? 502 : response.status,
+  throw (
+    lastError ??
+    new ShopMcpError("Failed to reach Shop MCP.", {
+      statusCode: 502,
       code: "UPSTREAM_HTTP_ERROR",
-    });
-  }
-
-  const rawText = await response.text();
-  const parsedRpc = parseMcpResponseBody(rawText, response.headers.get("content-type"));
-  return extractToolStructuredContent(parsedRpc);
+    })
+  );
 }
 
 export async function searchShopCatalog(

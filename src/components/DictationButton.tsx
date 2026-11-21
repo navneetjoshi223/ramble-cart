@@ -4,6 +4,7 @@ import { computeMicLevels, smoothLevel } from "../utils/micAudioMath";
 
 interface DictationButtonProps {
   dictating: boolean;
+  micStream?: MediaStream | null;
   onToggle: () => void;
 }
 
@@ -17,8 +18,11 @@ type WebkitWindow = Window & {
   webkitAudioContext?: typeof AudioContext;
 };
 
-export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
-  const [speaking, setSpeaking] = useState(false);
+export function DictationButton({
+  dictating,
+  micStream,
+  onToggle,
+}: DictationButtonProps) {
   const [meterReady, setMeterReady] = useState(false);
 
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -28,14 +32,11 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
   ]);
   const smoothedVolumeRef = useRef(0);
   const speakingHoldUntilRef = useRef(0);
-  const speakingStateRef = useRef(false);
 
   useEffect(() => {
     function resetBars() {
       smoothedBandsRef.current = [0, 0, 0, 0, 0];
       smoothedVolumeRef.current = 0;
-      speakingStateRef.current = false;
-      setSpeaking(false);
       setMeterReady(false);
       if (svgRef.current) {
         svgRef.current.setAttribute("data-volume", "0.00");
@@ -46,17 +47,18 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
         const y = (SVG_VIEWBOX_HEIGHT - MIN_BAR_HEIGHT) / 2;
         rect.setAttribute("y", y.toFixed(2));
         rect.setAttribute("height", MIN_BAR_HEIGHT.toFixed(2));
+        rect.setAttribute("fill", "#1F4E3D");
+        rect.setAttribute("fill-opacity", "0.45");
       }
     }
 
-    if (!dictating) {
+    if (!dictating || !micStream) {
       resetBars();
       return;
     }
 
     let cancelled = false;
     let rafId: number | null = null;
-    let stream: MediaStream | null = null;
     let audioCtx: AudioContext | null = null;
     let sourceNode: MediaStreamAudioSourceNode | null = null;
 
@@ -70,30 +72,16 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
       }
     };
 
-    async function setupMicAnalyser() {
+    function attachMicAnalyser(activeStream: MediaStream) {
       const AudioCtx =
         (window as WebkitWindow).AudioContext ||
         (window as WebkitWindow).webkitAudioContext;
 
-      if (!AudioCtx || !navigator.mediaDevices?.getUserMedia) {
+      if (!AudioCtx || activeStream.getAudioTracks().length === 0) {
         return;
       }
 
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-          video: false,
-        });
-
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-
         audioCtx = new AudioCtx();
         if (audioCtx.state === "suspended") {
           void audioCtx.resume().catch(() => {});
@@ -105,7 +93,7 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
         analyser.fftSize = 128;
         analyser.smoothingTimeConstant = 0.65;
 
-        sourceNode = audioCtx.createMediaStreamSource(stream);
+        sourceNode = audioCtx.createMediaStreamSource(activeStream);
         sourceNode.connect(analyser);
 
         const timeData = new Uint8Array(analyser.fftSize);
@@ -130,6 +118,12 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
                 snapshot.volume,
               );
 
+              if (snapshot.isSpeaking) {
+                speakingHoldUntilRef.current = now + 220;
+              }
+              const isVoiceActive =
+                snapshot.isSpeaking || now < speakingHoldUntilRef.current;
+
               for (let i = 0; i < 5; i++) {
                 const nextBand = smoothLevel(
                   smoothedBandsRef.current[i],
@@ -144,18 +138,9 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
                   const barY = (SVG_VIEWBOX_HEIGHT - barHeight) / 2;
                   rect.setAttribute("y", barY.toFixed(2));
                   rect.setAttribute("height", barHeight.toFixed(2));
+                  rect.setAttribute("fill", isVoiceActive ? "#14532D" : "#1F4E3D");
+                  rect.setAttribute("fill-opacity", isVoiceActive ? "1" : "0.75");
                 }
-              }
-
-              if (snapshot.isSpeaking) {
-                speakingHoldUntilRef.current = now + 200;
-              }
-              const nextSpeaking =
-                snapshot.isSpeaking || now < speakingHoldUntilRef.current;
-
-              if (nextSpeaking !== speakingStateRef.current) {
-                speakingStateRef.current = nextSpeaking;
-                setSpeaking(nextSpeaking);
               }
 
               if (svgRef.current) {
@@ -165,7 +150,7 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
                 );
                 svgRef.current.setAttribute(
                   "data-speaking",
-                  nextSpeaking ? "true" : "false",
+                  isVoiceActive ? "true" : "false",
                 );
               }
             }
@@ -176,12 +161,11 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
 
         rafId = window.requestAnimationFrame(tick);
       } catch {
-        // Microphone stream unavailable or permission denied; keep dictation button functional
         resetBars();
       }
     }
 
-    void setupMicAnalyser();
+    attachMicAnalyser(micStream);
 
     return () => {
       cancelled = true;
@@ -197,15 +181,12 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
           // ignore disconnect errors
         }
       }
-      if (stream) {
-        stream.getTracks().forEach((track) => track.stop());
-      }
       if (audioCtx) {
         void audioCtx.close().catch(() => {});
       }
       resetBars();
     };
-  }, [dictating]);
+  }, [dictating, micStream]);
 
   const restingY = (SVG_VIEWBOX_HEIGHT - MIN_BAR_HEIGHT) / 2;
 
@@ -216,22 +197,18 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
       aria-pressed={dictating}
       aria-label={
         dictating
-          ? speaking
-            ? "Microphone picking up voice — click to mute auto-dictation"
-            : "Auto-dictation active — click to mute"
-          : "Resume automatic voice dictation"
+          ? "Auto-dictation active — click to mute"
+          : "Start automatic voice dictation"
       }
-      className={`min-h-[40px] px-3.5 py-2 rounded-lg border text-xs font-medium flex items-center gap-2 transition-colors whitespace-nowrap shrink-0 ${
+      className={`min-h-[40px] min-w-[196px] px-3.5 py-2 rounded-lg border text-xs font-medium flex items-center justify-center gap-2 whitespace-nowrap shrink-0 ${
         dictating
-          ? speaking
-            ? "border-[#1F4E3D] bg-[#DCFCE7] text-[#14532D] ring-2 ring-[#1F4E3D]/20"
-            : "border-[#1F4E3D] bg-[#ECFDF5] text-[#1F4E3D]"
+          ? "border-[#1F4E3D] bg-[#ECFDF5] text-[#14532D]"
           : "border-[#E7E5E0] bg-white text-[#18181B] hover:border-[#18181B]"
       }`}
     >
       {dictating ? (
         <>
-          <Mic className="w-3.5 h-3.5 shrink-0" />
+          <Mic className="w-3.5 h-3.5 shrink-0 text-[#1F4E3D]" />
           <svg
             ref={svgRef}
             width="20"
@@ -255,13 +232,8 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
                 width="2.4"
                 height={MIN_BAR_HEIGHT}
                 rx="1.2"
-                className={
-                  speaking
-                    ? "fill-[#14532D]"
-                    : meterReady
-                      ? "fill-[#1F4E3D]/75"
-                      : "fill-[#1F4E3D]/40"
-                }
+                fill="#1F4E3D"
+                fillOpacity={meterReady ? 0.75 : 0.45}
               />
             ))}
           </svg>
@@ -270,7 +242,7 @@ export function DictationButton({ dictating, onToggle }: DictationButtonProps) {
       ) : (
         <>
           <MicOff className="w-3.5 h-3.5 shrink-0 text-[#57534E]" />
-          <span>Resume Auto-Dictate</span>
+          <span>Auto-Dictate</span>
         </>
       )}
     </button>

@@ -10,6 +10,15 @@ import {
   SlidingWindowRateLimiter,
 } from "./server/shopMcp.js";
 import { interpretSpaceAndRamble } from "./server/geminiAgent.js";
+import { extractProductEvidenceWithNeon } from "./server/neonAgent.js";
+import { evaluateShoppingDecision } from "./server/decisionsAgent.js";
+import type {
+  ActiveConstraint,
+  DecisionTriggerSource,
+  NormalizedProduct,
+  PreviousSessionContext,
+  RambleInterpretResponse,
+} from "./src/types.js";
 
 const PORT = Number(process.env.PORT) || 3000;
 const shopRateLimiter = new SlidingWindowRateLimiter(30, 60_000);
@@ -20,6 +29,35 @@ function getClientKey(req: express.Request): string {
     return forwarded.split(",")[0].trim();
   }
   return req.ip || "local";
+}
+
+function handleGeminiRouteError(
+  res: express.Response,
+  routeLabel: string,
+  err: unknown,
+) {
+  const body = (err as { body?: string })?.body;
+  const rawMsg =
+    body || (err instanceof Error ? err.message : "Could not process Gemini request.");
+
+  let friendly = rawMsg;
+  if (rawMsg.includes("API_KEY_INVALID") || rawMsg.includes("PERMISSION_DENIED")) {
+    friendly =
+      "Gemini API key in Settings > Secrets is invalid or not set. Update GEMINI_API_KEY there, or search Shop MCP directly below.";
+    console.warn(`[${routeLabel}] Gemini API key invalid or missing.`);
+  } else if (rawMsg.includes("RESOURCE_EXHAUSTED")) {
+    friendly =
+      "Gemini API quota exceeded. Check billing/quota in Settings > Secrets.";
+    console.warn(`[${routeLabel}] Gemini API quota exceeded.`);
+  } else if (rawMsg.includes("NOT_FOUND")) {
+    friendly = "Requested Gemini model is unavailable for this API key.";
+    console.warn(`[${routeLabel}] Requested Gemini model not found.`);
+  } else {
+    console.error(`[${routeLabel}] error:`, rawMsg);
+  }
+
+  const status = rawMsg.includes("GEMINI_API_KEY") ? 503 : 400;
+  return res.status(status).json({ error: friendly });
 }
 
 function handleApiError(res: express.Response, err: unknown) {
@@ -55,6 +93,9 @@ async function startServer() {
     res.json({
       ok: true,
       shopMcpEndpoint: "https://mcp.shop.com",
+      decisionsModel: "gemini-decision-1",
+      intentModel: "gemini-4-hydrogen",
+      spatialAndEvidenceModel: "gemini-4-neon",
       hasGeminiKey: Boolean(process.env.GEMINI_API_KEY?.trim()),
     });
   });
@@ -113,16 +154,125 @@ async function startServer() {
     }
   });
 
-  app.post("/api/ramble/interpret", async (req, res) => {
+  app.post("/api/shop/product/evidence", async (req, res) => {
+    const rate = shopRateLimiter.check(getClientKey(req));
+    if (!rate.allowed) {
+      res.setHeader("Retry-After", String(rate.retryAfterSeconds));
+      return res.status(429).json({
+        error: "Too many product verification requests. Please wait a moment.",
+        code: "LOCAL_RATE_LIMITED",
+      });
+    }
+
     try {
-      const { videoFrames, imageBase64, mimeType, rambleText } = (req.body ?? {}) as {
+      const { product, activeConstraints, maxPriceUsd, spatialSummary } = (req.body ??
+        {}) as {
+        product?: NormalizedProduct;
+        activeConstraints?: ActiveConstraint[];
+        maxPriceUsd?: number | null;
+        spatialSummary?: string | null;
+      };
+
+      if (!product || typeof product.id !== "string" || typeof product.title !== "string") {
+        return res.status(400).json({
+          error: "A valid NormalizedProduct with id and title is required for Neon verification.",
+          code: "VALIDATION_ERROR",
+        });
+      }
+
+      const safeConstraints = Array.isArray(activeConstraints)
+        ? activeConstraints.filter(
+            (c): c is ActiveConstraint =>
+              Boolean(c && typeof c.text === "string" && typeof c.kind === "string"),
+          )
+        : [];
+
+      const evidence = await extractProductEvidenceWithNeon({
+        product,
+        activeConstraints: safeConstraints,
+        maxPriceUsd:
+          typeof maxPriceUsd === "number" && Number.isFinite(maxPriceUsd) && maxPriceUsd > 0
+            ? maxPriceUsd
+            : null,
+        spatialSummary:
+          typeof spatialSummary === "string" && spatialSummary.trim()
+            ? spatialSummary.trim()
+            : null,
+      });
+
+      res.json(evidence);
+    } catch (err) {
+      handleGeminiRouteError(res, "/api/shop/product/evidence", err);
+    }
+  });
+
+  app.post("/api/ramble/decide", async (req, res) => {
+    try {
+      const {
+        videoFrames,
+        imageBase64,
+        mimeType,
+        rambleText,
+        triggerSource,
+        previousContext,
+      } = (req.body ?? {}) as {
         videoFrames?: string[];
         imageBase64?: string;
         mimeType?: string;
         rambleText?: string;
+        triggerSource?: DecisionTriggerSource;
+        previousContext?: PreviousSessionContext | null;
+      };
+
+      const cleanedFrames = Array.isArray(videoFrames)
+        ? videoFrames
+            .filter((f): f is string => typeof f === "string" && f.length > 0)
+            .slice(-4)
+        : [];
+      const cleanedText = rambleText?.trim() || "";
+
+      if (!cleanedText && cleanedFrames.length === 0 && !imageBase64) {
+        return res.status(400).json({
+          error: "Start live video or speak/type a request to evaluate a decision.",
+        });
+      }
+
+      const decision = await evaluateShoppingDecision({
+        videoFrames: cleanedFrames,
+        imageBase64: imageBase64 ?? null,
+        mimeType: mimeType ?? "image/jpeg",
+        rambleText: cleanedText,
+        triggerSource: triggerSource ?? "manual_submit",
+        previousContext: previousContext ?? null,
+      });
+
+      res.json(decision);
+    } catch (err) {
+      handleGeminiRouteError(res, "/api/ramble/decide", err);
+    }
+  });
+
+  app.post("/api/ramble/interpret", async (req, res) => {
+    try {
+      const {
+        videoFrames,
+        imageBase64,
+        mimeType,
+        rambleText,
+        triggerSource,
+        previousContext,
+      } = (req.body ?? {}) as {
+        videoFrames?: string[];
+        imageBase64?: string;
+        mimeType?: string;
+        rambleText?: string;
+        triggerSource?: DecisionTriggerSource;
+        previousContext?: PreviousSessionContext | null;
       };
       const cleanedFrames = Array.isArray(videoFrames)
-        ? videoFrames.filter((f): f is string => typeof f === "string" && f.length > 0).slice(-4)
+        ? videoFrames
+            .filter((f): f is string => typeof f === "string" && f.length > 0)
+            .slice(-4)
         : [];
       const cleanedText = rambleText?.trim() || "";
       if (!cleanedText && cleanedFrames.length === 0 && !imageBase64) {
@@ -130,38 +280,53 @@ async function startServer() {
           error: "Start live video or describe what fits your space first.",
         });
       }
+
+      // Step 1: Gemini Decisions API (`gemini-decision-1`) calibrated action & readiness check
+      const decision = await evaluateShoppingDecision({
+        videoFrames: cleanedFrames,
+        imageBase64: imageBase64 ?? null,
+        mimeType: mimeType ?? "image/jpeg",
+        rambleText: cleanedText,
+        triggerSource: triggerSource ?? "manual_submit",
+        previousContext: previousContext ?? null,
+      });
+
+      // Prevent premature or redundant Shop MCP searches when Decisions API says to wait/clarify
+      if (!decision.shouldSearch) {
+        const gatedPayload: RambleInterpretResponse = {
+          decision,
+          shouldExecuteSearch: false,
+          interpretation: null,
+        };
+        return res.json(gatedPayload);
+      }
+
+      // Step 2: Dual Gemini 4 (Hydrogen speech intent + Neon spatial perception)
       const effectivePrompt =
         cleanedText ||
         "Analyze the live camera video stream and generate a concise Shop MCP product search query for the main item or space need shown.";
+
       const interpretation = await interpretSpaceAndRamble({
         videoFrames: cleanedFrames,
         imageBase64: imageBase64 ?? null,
         mimeType: mimeType ?? "image/jpeg",
         rambleText: effectivePrompt,
+        hasSpokenTranscript: Boolean(cleanedText),
+        previousContext: previousContext ?? null,
+        decisionHint: {
+          action: decision.action,
+          isConstraintCorrection: decision.isConstraintCorrection,
+        },
       });
-      res.json(interpretation);
+
+      const payload: RambleInterpretResponse = {
+        decision,
+        shouldExecuteSearch: true,
+        interpretation,
+      };
+      res.json(payload);
     } catch (err) {
-      const body = (err as { body?: string })?.body;
-      const rawMsg = body || (err instanceof Error ? err.message : "Could not interpret space.");
-
-      let friendly = rawMsg;
-      if (rawMsg.includes("API_KEY_INVALID") || rawMsg.includes("PERMISSION_DENIED")) {
-        friendly =
-          "Gemini API key in Settings > Secrets is invalid or not set. Update GEMINI_API_KEY there, or search Shop MCP directly below.";
-        console.warn("[/api/ramble/interpret] Gemini API key invalid or missing.");
-      } else if (rawMsg.includes("RESOURCE_EXHAUSTED")) {
-        friendly =
-          "Gemini API quota exceeded. Check billing/quota in Settings > Secrets.";
-        console.warn("[/api/ramble/interpret] Gemini API quota exceeded.");
-      } else if (rawMsg.includes("NOT_FOUND")) {
-        friendly = "Requested Gemini model is unavailable for this API key.";
-        console.warn("[/api/ramble/interpret] Requested Gemini model not found.");
-      } else {
-        console.error("[/api/ramble/interpret] error:", rawMsg);
-      }
-
-      const status = rawMsg.includes("GEMINI_API_KEY") ? 503 : 400;
-      res.status(status).json({ error: friendly });
+      handleGeminiRouteError(res, "/api/ramble/interpret", err);
     }
   });
 

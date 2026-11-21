@@ -12,13 +12,17 @@ import {
   Radio,
 } from "lucide-react";
 import type {
+  DecisionTriggerSource,
   NormalizedProduct,
+  RambleInterpretResponse,
   SearchCatalogResult,
+  ShoppingDecisionResult,
   SpaceQueryInterpretation,
 } from "./types";
 import { ProductImage } from "./components/ProductImage";
 import { ProductDetailModal } from "./components/ProductDetailModal";
 import { DictationButton } from "./components/DictationButton";
+import { DecisionStatusPanel } from "./components/DecisionStatusPanel";
 import { safeFetchJson } from "./utils/safeFetchJson";
 
 const SAMPLE_QUERIES = [
@@ -58,33 +62,49 @@ export function App() {
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [rambleText, setRambleText] = useState("");
   const [dictating, setDictating] = useState(false);
-  const [autoDictateEnabled, setAutoDictateEnabled] = useState(true);
+  const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const [interpreting, setInterpreting] = useState(false);
   const [interpretation, setInterpretation] = useState<SpaceQueryInterpretation | null>(null);
+  const [latestDecision, setLatestDecision] = useState<ShoppingDecisionResult | null>(null);
+  const [preventedSearchCount, setPreventedSearchCount] = useState(0);
   const [interpretError, setInterpretError] = useState<string | null>(null);
 
   const searchAbortRef = useRef<AbortController | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const startingDictationRef = useRef(false);
   const videoFramesRef = useRef<string[]>([]);
   const rambleTextRef = useRef("");
+  const interpretationRef = useRef<SpaceQueryInterpretation | null>(null);
   const lastAutoInterpretedTextRef = useRef("");
   const speechPauseTimerRef = useRef<number | null>(null);
-  const autoDictateEnabledRef = useRef(true);
+  const dictationRestartTimerRef = useRef<number | null>(null);
+  const dictationStartedAtRef = useRef(0);
+  const consecutiveQuickEndsRef = useRef(0);
+  const lastSpeechErrorRef = useRef<string | null>(null);
+  const autoDictateEnabledRef = useRef(false);
   const dictatingRef = useRef(false);
   const interpretingRef = useRef(false);
   const recognitionRef = useRef<{ start: () => void; stop: () => void } | null>(null);
 
   useEffect(() => {
     runSearch("ceramic coffee dripper");
-    startAutoDictation(true);
+    // Auto-start dictation on mount ONLY if microphone permission was already granted
+    // for this origin, avoiding iframe gesture rejections and start/error flicker loops.
+    if (navigator.permissions?.query) {
+      navigator.permissions
+        .query({ name: "microphone" as PermissionName })
+        .then((status) => {
+          if (status.state === "granted") {
+            void startAutoDictation(true);
+          }
+        })
+        .catch(() => {});
+    }
     return () => {
       searchAbortRef.current?.abort();
-      autoDictateEnabledRef.current = false;
-      if (speechPauseTimerRef.current) {
-        window.clearTimeout(speechPauseTimerRef.current);
-      }
-      recognitionRef.current?.stop();
+      stopDictation();
       stopCamera();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -220,7 +240,7 @@ export function App() {
     if (!cameraActive || !liveAutoSync) return;
     const syncTimer = window.setInterval(() => {
       if (!interpretingRef.current && videoFramesRef.current.length > 0) {
-        void handleInterpretAndSearch();
+        void handleInterpretAndSearch("live_auto_sync");
       }
     }, 5000);
     return () => window.clearInterval(syncTimer);
@@ -230,10 +250,10 @@ export function App() {
   async function startCamera(preferredFacing: "environment" | "user" = facingMode) {
     setCameraError(null);
 
-    // Ensure auto-dictation starts on this user gesture
-    autoDictateEnabledRef.current = true;
-    setAutoDictateEnabled(true);
-    startAutoDictation(true);
+    // Ensure auto-dictation starts on this user gesture if not already active
+    if (!dictatingRef.current && !startingDictationRef.current) {
+      void startAutoDictation(true);
+    }
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setCameraError("Live video input is not supported in this browser context.");
@@ -302,7 +322,36 @@ export function App() {
     startCamera(nextFacing);
   }
 
-  function startAutoDictation(silentIfUnsupported = false) {
+  function stopDictation() {
+    startingDictationRef.current = false;
+    autoDictateEnabledRef.current = false;
+    if (dictationRestartTimerRef.current) {
+      window.clearTimeout(dictationRestartTimerRef.current);
+      dictationRestartTimerRef.current = null;
+    }
+    if (speechPauseTimerRef.current) {
+      window.clearTimeout(speechPauseTimerRef.current);
+      speechPauseTimerRef.current = null;
+    }
+    const activeRec = recognitionRef.current;
+    recognitionRef.current = null;
+    try {
+      activeRec?.stop();
+    } catch {
+      // ignore if already stopped
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    }
+    setMicStream(null);
+    dictatingRef.current = false;
+    setDictating(false);
+  }
+
+  async function startAutoDictation(silentIfUnsupported = false) {
+    if (startingDictationRef.current) return;
+
     const SpeechRec =
       (
         window as unknown as {
@@ -314,17 +363,60 @@ export function App() {
         .webkitSpeechRecognition;
 
     if (!SpeechRec) {
+      stopDictation();
       if (!silentIfUnsupported) {
-        setInterpretError("Speech dictation is unavailable in this browser. Type your request below.");
+        setInterpretError(
+          "Speech dictation is unavailable in this browser. Type your request below.",
+        );
       }
       return;
     }
 
+    startingDictationRef.current = true;
+
+    if (dictationRestartTimerRef.current) {
+      window.clearTimeout(dictationRestartTimerRef.current);
+      dictationRestartTimerRef.current = null;
+    }
+
     if (recognitionRef.current) {
+      const prevRec = recognitionRef.current;
+      recognitionRef.current = null;
       try {
-        recognitionRef.current.stop();
+        prevRec.stop();
       } catch {
         // ignore if already stopped
+      }
+    }
+
+    // Open microphone stream BEFORE SpeechRecognition.start() so macOS/iOS audio unit
+    // initialization never interrupts an already-running SpeechRecognition session.
+    if (!micStreamRef.current && navigator.mediaDevices?.getUserMedia) {
+      try {
+        const openedMic = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false,
+        });
+        if (!startingDictationRef.current) {
+          openedMic.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        micStreamRef.current = openedMic;
+        setMicStream(openedMic);
+      } catch {
+        // If mic permission was denied, abort cleanly without flickering
+        startingDictationRef.current = false;
+        stopDictation();
+        if (!silentIfUnsupported) {
+          setInterpretError(
+            "Microphone permission denied. Allow microphone access or type your request below.",
+          );
+        }
+        return;
       }
     }
 
@@ -344,11 +436,20 @@ export function App() {
     rec.continuous = true;
     rec.interimResults = true;
     rec.lang = "en-US";
+
     rec.onstart = () => {
+      if (recognitionRef.current !== rec) return;
+      startingDictationRef.current = false;
+      dictationStartedAtRef.current = Date.now();
+      lastSpeechErrorRef.current = null;
       dictatingRef.current = true;
       setDictating(true);
     };
+
     rec.onresult = (event) => {
+      if (recognitionRef.current !== rec) return;
+      consecutiveQuickEndsRef.current = 0;
+
       let text = "";
       for (let i = 0; i < event.results.length; i++) {
         text += event.results[i][0]?.transcript ?? "";
@@ -371,62 +472,104 @@ export function App() {
           !interpretingRef.current
         ) {
           lastAutoInterpretedTextRef.current = latest;
-          void handleInterpretAndSearch();
+          void handleInterpretAndSearch("speech_pause");
         }
       }, 1400);
     };
+
     rec.onerror = (event) => {
-      dictatingRef.current = false;
-      setDictating(false);
-      if (event.error === "service-not-allowed") {
-        autoDictateEnabledRef.current = false;
-        setAutoDictateEnabled(false);
+      if (recognitionRef.current !== rec) return;
+      startingDictationRef.current = false;
+      const errCode = event.error || "unknown";
+      lastSpeechErrorRef.current = errCode;
+
+      // Quiet silence timeout ('no-speech') is normal during continuous listening:
+      // keep the button & micStream steady so onend rolls over seamlessly without flicker.
+      if (errCode === "no-speech" && autoDictateEnabledRef.current) {
+        return;
       }
-    };
-    rec.onend = () => {
-      dictatingRef.current = false;
-      if (autoDictateEnabledRef.current) {
-        window.setTimeout(() => {
-          if (!autoDictateEnabledRef.current || dictatingRef.current) return;
-          try {
-            rec.start();
-          } catch {
-            setDictating(false);
-          }
-        }, 300);
-      } else {
-        setDictating(false);
+
+      // Terminal permission, gesture, or hardware errors must halt auto-restart immediately
+      if (
+        errCode === "not-allowed" ||
+        errCode === "service-not-allowed" ||
+        errCode === "audio-capture" ||
+        errCode === "language-not-supported" ||
+        errCode === "network"
+      ) {
+        stopDictation();
+        return;
+      }
+
+      if (!autoDictateEnabledRef.current) {
+        stopDictation();
       }
     };
 
+    rec.onend = () => {
+      if (recognitionRef.current !== rec) return;
+      startingDictationRef.current = false;
+
+      if (!autoDictateEnabledRef.current) {
+        stopDictation();
+        return;
+      }
+
+      // Guard against rapid start->end failure loops (< 1200ms without 'no-speech')
+      const elapsedMs = Date.now() - dictationStartedAtRef.current;
+      if (elapsedMs < 1200 && lastSpeechErrorRef.current !== "no-speech") {
+        consecutiveQuickEndsRef.current += 1;
+      } else {
+        consecutiveQuickEndsRef.current = 0;
+      }
+
+      if (consecutiveQuickEndsRef.current >= 2) {
+        stopDictation();
+        return;
+      }
+
+      // Seamless rollover restart without toggling dictating false -> true
+      if (dictationRestartTimerRef.current) {
+        window.clearTimeout(dictationRestartTimerRef.current);
+      }
+      dictationRestartTimerRef.current = window.setTimeout(() => {
+        dictationRestartTimerRef.current = null;
+        if (!autoDictateEnabledRef.current || recognitionRef.current !== rec) {
+          return;
+        }
+        try {
+          dictationStartedAtRef.current = Date.now();
+          rec.start();
+        } catch {
+          stopDictation();
+        }
+      }, 250);
+    };
+
     recognitionRef.current = rec;
+    consecutiveQuickEndsRef.current = 0;
+    lastSpeechErrorRef.current = null;
     autoDictateEnabledRef.current = true;
-    setAutoDictateEnabled(true);
+
     try {
+      dictationStartedAtRef.current = Date.now();
       rec.start();
-      dictatingRef.current = true;
-      setDictating(true);
     } catch {
-      dictatingRef.current = false;
-      setDictating(false);
+      stopDictation();
     }
   }
 
   function toggleDictation() {
-    if (autoDictateEnabled && dictating) {
-      autoDictateEnabledRef.current = false;
-      setAutoDictateEnabled(false);
-      if (speechPauseTimerRef.current) {
-        window.clearTimeout(speechPauseTimerRef.current);
-      }
-      recognitionRef.current?.stop();
-      setDictating(false);
+    if (dictatingRef.current || dictating || startingDictationRef.current) {
+      stopDictation();
       return;
     }
-    startAutoDictation(false);
+    void startAutoDictation(false);
   }
 
-  async function handleInterpretAndSearch() {
+  async function handleInterpretAndSearch(
+    triggerSource: DecisionTriggerSource = "manual_submit",
+  ) {
     if (cameraActive) {
       sampleCurrentVideoFrame();
     }
@@ -444,21 +587,45 @@ export function App() {
     setInterpreting(true);
     setInterpretError(null);
 
+    const prev = interpretationRef.current;
+
     try {
-      const parsed = await safeFetchJson<SpaceQueryInterpretation>("/api/ramble/interpret", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          videoFrames: framesToSend,
-          mimeType: "image/jpeg",
-          rambleText: currentText,
-        }),
-      });
+      const response = await safeFetchJson<RambleInterpretResponse>(
+        "/api/ramble/interpret",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            videoFrames: framesToSend,
+            mimeType: "image/jpeg",
+            rambleText: currentText,
+            triggerSource,
+            previousContext: prev
+              ? {
+                  searchQuery: prev.searchQuery,
+                  maxPriceUsd: prev.maxPriceUsd,
+                  activeConstraints: prev.activeConstraints,
+                  sceneSummary: prev.sceneSummary,
+                }
+              : null,
+          }),
+        },
+      );
+
+      setLatestDecision(response.decision);
+
+      if (!response.shouldExecuteSearch || !response.interpretation) {
+        if (triggerSource !== "manual_submit") {
+          setPreventedSearchCount((count) => count + 1);
+        }
+        return;
+      }
+
+      const parsed = response.interpretation;
+      interpretationRef.current = parsed;
       setInterpretation(parsed);
       setQuery(parsed.searchQuery);
-      if (parsed.maxPriceUsd) {
-        setMaxPriceInput(String(parsed.maxPriceUsd));
-      }
+      setMaxPriceInput(parsed.maxPriceUsd ? String(parsed.maxPriceUsd) : "");
       await runSearch(parsed.searchQuery, {
         overrideMaxUsd: parsed.maxPriceUsd,
       });
@@ -470,6 +637,44 @@ export function App() {
       interpretingRef.current = false;
       setInterpreting(false);
     }
+  }
+
+  function handleRemoveConstraint(index: number) {
+    const current = interpretationRef.current;
+    if (!current) return;
+    const removed = current.activeConstraints[index];
+    if (!removed) return;
+
+    const nextActive = current.activeConstraints.filter((_, idx) => idx !== index);
+    const removedLooksLikePrice =
+      /\$|\b(under|below|max|budget)\b/i.test(removed.text);
+    const nextMaxUsd = removedLooksLikePrice ? null : current.maxPriceUsd;
+
+    // Strip the relaxed constraint token from the search query when present
+    const strippedWords = removed.text
+      .replace(/^(no|without|under|below)\s+/i, "")
+      .trim();
+    const escaped = strippedWords.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const nextQueryCandidate = escaped
+      ? current.searchQuery.replace(new RegExp(`\\b${escaped}\\b`, "ig"), "").replace(/\s{2,}/g, " ").trim()
+      : current.searchQuery;
+    const finalQuery = nextQueryCandidate || current.searchQuery;
+
+    const updated: SpaceQueryInterpretation = {
+      ...current,
+      searchQuery: finalQuery,
+      maxPriceUsd: nextMaxUsd,
+      activeConstraints: nextActive,
+      supersededConstraints: [...current.supersededConstraints, removed.text],
+    };
+
+    interpretationRef.current = updated;
+    setInterpretation(updated);
+    setQuery(finalQuery);
+    if (removedLooksLikePrice) {
+      setMaxPriceInput("");
+    }
+    void runSearch(finalQuery, { overrideMaxUsd: nextMaxUsd });
   }
 
   const fetchedTimestamp = searchResult?.fetchedAt
@@ -621,6 +826,7 @@ export function App() {
                     </label>
                     <DictationButton
                       dictating={dictating}
+                      micStream={micStream}
                       onToggle={toggleDictation}
                     />
                   </div>
@@ -628,31 +834,17 @@ export function App() {
                     id="space-ramble"
                     rows={2}
                     value={rambleText}
-                    onFocus={() => {
-                      if (autoDictateEnabledRef.current && !dictating) {
-                        startAutoDictation(true);
-                      }
-                    }}
                     onChange={(e) => setRambleText(e.target.value)}
                     placeholder="Speak freely while panning your camera—auto-dictation transcribes and searches when you pause."
                     className="w-full rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] px-3.5 py-2.5 text-sm focus:bg-white focus:outline-none focus:border-[#1F4E3D]"
                   />
 
-                  {interpretation && (
-                    <div className="text-xs text-[#57534E] space-y-1 pt-1">
-                      <p className="text-[#18181B]">{interpretation.sceneSummary}</p>
-                      <p>
-                        Query: <strong className="text-[#18181B]">{interpretation.searchQuery}</strong>
-                        {interpretation.activeConstraints.length > 0 &&
-                          ` · ${interpretation.activeConstraints.map((c) => `${c.kind}: ${c.text}`).join(" · ")}`}
-                      </p>
-                      {interpretation.supersededConstraints.length > 0 && (
-                        <p className="line-through text-[#A8A29E]">
-                          Replaced: {interpretation.supersededConstraints.join(", ")}
-                        </p>
-                      )}
-                    </div>
-                  )}
+                  <DecisionStatusPanel
+                    decision={latestDecision}
+                    interpretation={interpretation}
+                    preventedSearchCount={preventedSearchCount}
+                    onRemoveConstraint={handleRemoveConstraint}
+                  />
 
                   {interpretError && (
                     <div className="text-xs text-[#991B1B] bg-[#FEF2F2] border border-[#FECACA] rounded-lg px-3 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -675,14 +867,14 @@ export function App() {
 
                 <button
                   type="button"
-                  onClick={handleInterpretAndSearch}
+                  onClick={() => void handleInterpretAndSearch("manual_submit")}
                   disabled={interpreting}
                   className="min-h-[44px] px-4 py-2.5 rounded-lg bg-[#1F4E3D] text-white text-xs font-medium hover:bg-[#173B2E] disabled:opacity-60 flex items-center justify-center gap-2 self-start"
                 >
                   <Sparkles className="w-3.5 h-3.5" />
                   <span>
                     {interpreting
-                      ? "Analyzing Live Video Stream..."
+                      ? "Evaluating Decision & Space..."
                       : "Interpret Live Video & Search"}
                   </span>
                 </button>
@@ -986,6 +1178,14 @@ export function App() {
         product={inspectedProduct}
         country={country}
         currency={currency}
+        activeConstraints={interpretation?.activeConstraints ?? []}
+        maxPriceUsd={
+          interpretation?.maxPriceUsd ??
+          (maxPriceInput.trim() && Number(maxPriceInput) > 0
+            ? Number(maxPriceInput)
+            : null)
+        }
+        spatialSummary={interpretation?.sceneSummary ?? null}
         onClose={() => setInspectedProduct(null)}
       />
     </div>
