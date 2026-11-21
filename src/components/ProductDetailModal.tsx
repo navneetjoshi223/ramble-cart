@@ -8,18 +8,27 @@ import {
   Clock,
   Star,
   ScanSearch,
+  Ruler,
 } from "lucide-react";
 import type {
   ActiveConstraint,
+  ActiveSpatialLimit,
   ConstraintVerdict,
+  DimensionAxis,
   GetProductResult,
   NormalizedOptionSelection,
   NormalizedProduct,
   ProductEvidenceResult,
   VerificationStatus,
+  WidthFitVerdict,
 } from "../types";
 import { ProductImage } from "./ProductImage";
 import { safeFetchJson } from "../utils/safeFetchJson";
+import {
+  createSkippedMeasurementEvaluation,
+  evaluateSpatialLimitFit,
+  extractSelectedVariantDimension,
+} from "../utils/widthFitCheck";
 
 interface ProductDetailModalProps {
   product: NormalizedProduct | null;
@@ -28,6 +37,11 @@ interface ProductDetailModalProps {
   activeConstraints?: ActiveConstraint[];
   maxPriceUsd?: number | null;
   spatialSummary?: string | null;
+  spatialLimit?: ActiveSpatialLimit | null;
+  fitRequested?: boolean;
+  fitAxis?: DimensionAxis;
+  precomputedEvidence?: ProductEvidenceResult | null;
+  onMeasureSpace?: () => void;
   onClose: () => void;
 }
 
@@ -53,6 +67,43 @@ function getStatusPresentation(status: VerificationStatus) {
         label: "UNCERTAIN · UNVERIFIED SPEC",
         textClass: "text-[#9A3412]",
         surfaceClass: "bg-[#FFF7ED] border-[#FED7AA]",
+        Icon: HelpCircle,
+      };
+  }
+}
+
+function getWidthVerdictPresentation(verdict: WidthFitVerdict) {
+  switch (verdict) {
+    case "Width fits":
+    case "Height fits":
+    case "Depth fits":
+      return {
+        textClass: "text-[#14532D]",
+        surfaceClass: "bg-[#ECFDF5] border-[#1F4E3D]/40",
+        Icon: CheckCircle2,
+      };
+    case "Too wide":
+    case "Too tall":
+    case "Too deep":
+      return {
+        textClass: "text-[#991B1B]",
+        surfaceClass: "bg-[#FEF2F2] border-[#FECACA]",
+        Icon: AlertCircle,
+      };
+    case "Too close to confirm":
+      return {
+        textClass: "text-[#9A3412]",
+        surfaceClass: "bg-[#FFF7ED] border-[#FED7AA]",
+        Icon: AlertCircle,
+      };
+    case "Width unknown":
+    case "Height unknown":
+    case "Depth unknown":
+    case "Fit unknown":
+    default:
+      return {
+        textClass: "text-[#57534E]",
+        surfaceClass: "bg-[#FAF9F6] border-[#E7E5E0]",
         Icon: HelpCircle,
       };
   }
@@ -91,11 +142,17 @@ export function ProductDetailModal({
   activeConstraints = [],
   maxPriceUsd = null,
   spatialSummary = null,
+  spatialLimit = null,
+  fitRequested = false,
+  fitAxis = "width",
+  precomputedEvidence = null,
+  onMeasureSpace,
   onClose,
 }: ProductDetailModalProps) {
   const [liveDetails, setLiveDetails] = useState<GetProductResult | null>(null);
   const [selectedOptions, setSelectedOptions] = useState<NormalizedOptionSelection[]>([]);
   const [selectedImageIdx, setSelectedImageIdx] = useState(0);
+  const [highlightListingEvidence, setHighlightListingEvidence] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -105,12 +162,15 @@ export function ProductDetailModal({
 
   const abortRef = useRef<AbortController | null>(null);
   const evidenceAbortRef = useRef<AbortController | null>(null);
+  const galleryContainerRef = useRef<HTMLDivElement | null>(null);
+  const listingSectionRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!product) {
       setLiveDetails(null);
       setSelectedOptions([]);
       setSelectedImageIdx(0);
+      setHighlightListingEvidence(false);
       setError(null);
       setEvidence(null);
       setEvidenceError(null);
@@ -126,9 +186,14 @@ export function ProductDetailModal({
 
     setSelectedOptions(initialSelection);
     setSelectedImageIdx(0);
+    setHighlightListingEvidence(false);
     setLiveDetails(null);
     setError(null);
-    setEvidence(null);
+    setEvidence(
+      precomputedEvidence && precomputedEvidence.productId === product.id
+        ? precomputedEvidence
+        : null,
+    );
     setEvidenceError(null);
 
     void fetchProductCombination(product.id, initialSelection);
@@ -141,12 +206,22 @@ export function ProductDetailModal({
   }, [product?.id, country, currency]);
 
   const hasAutoVerifyTargets =
+    Boolean(spatialLimit) ||
     activeConstraints.length > 0 ||
     (typeof maxPriceUsd === "number" && maxPriceUsd > 0);
 
-  // Automatically verify with Gemini 4 Neon when live variant details arrive and constraints exist
+  // Automatically verify with Gemini 4 Neon when live variant details arrive and
+  // either spatial limit or shopping constraints are active.
   useEffect(() => {
     if (!liveDetails?.product || !hasAutoVerifyTargets) return;
+    const liveVariantId = liveDetails.product.primaryVariant?.id ?? null;
+    if (
+      evidence &&
+      evidence.productId === liveDetails.product.id &&
+      evidence.variantId === liveVariantId
+    ) {
+      return;
+    }
     void runNeonEvidenceVerification(liveDetails.product);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
@@ -178,9 +253,11 @@ export function ProductDetailModal({
         }),
         signal: controller.signal,
       });
+      if (abortRef.current !== controller) return;
       setLiveDetails(data);
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
+      if (abortRef.current !== controller) return;
       setError(err instanceof Error ? err.message : "Failed to confirm product details.");
     } finally {
       if (abortRef.current === controller) {
@@ -212,9 +289,11 @@ export function ProductDetailModal({
           signal: controller.signal,
         },
       );
+      if (evidenceAbortRef.current !== controller) return;
       setEvidence(res);
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
+      if (evidenceAbortRef.current !== controller) return;
       setEvidenceError(
         err instanceof Error
           ? err.message
@@ -262,6 +341,26 @@ export function ProductDetailModal({
   const safeOfferUrl = activeVariant?.url ?? null;
   const safeSellerUrl = seller?.url ?? null;
 
+  const targetAxis: DimensionAxis = spatialLimit?.axis ?? fitAxis;
+  const documentedDim = extractSelectedVariantDimension(
+    activeProduct,
+    evidence,
+    targetAxis,
+  );
+
+  const fitEvaluation = spatialLimit
+    ? evaluateSpatialLimitFit({
+        limit: spatialLimit,
+        documentedDimension: documentedDim,
+      })
+    : fitRequested
+      ? createSkippedMeasurementEvaluation(targetAxis, documentedDim)
+      : null;
+
+  const widthVerdictMeta = fitEvaluation
+    ? getWidthVerdictPresentation(fitEvaluation.verdict)
+    : null;
+
   function handleOptionChange(optionName: string, label: string) {
     const nextSelection = activeProduct.options.map((opt) => {
       if (opt.name === optionName) {
@@ -271,6 +370,7 @@ export function ProductDetailModal({
       return { name: opt.name, label: existing?.label ?? opt.values[0] ?? label };
     });
     setSelectedOptions(nextSelection);
+    setHighlightListingEvidence(false);
     setEvidence(null);
     void fetchProductCombination(activeProduct.id, nextSelection);
   }
@@ -279,7 +379,19 @@ export function ProductDetailModal({
     const zeroBased = imageIndex1Based - 1;
     if (zeroBased >= 0 && zeroBased < galleryMedia.length) {
       setSelectedImageIdx(zeroBased);
+      galleryContainerRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "nearest",
+      });
     }
+  }
+
+  function jumpToListingDetails() {
+    setHighlightListingEvidence(true);
+    listingSectionRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+    });
   }
 
   const fetchedTimeLabel = liveDetails?.fetchedAt
@@ -311,7 +423,7 @@ export function ProductDetailModal({
           <X className="w-4 h-4" />
         </button>
 
-        <div className="bg-[#F7F6F3] flex flex-col">
+        <div ref={galleryContainerRef} className="bg-[#F7F6F3] flex flex-col">
           <div className="relative aspect-[4/3] w-full overflow-hidden">
             <ProductImage
               src={heroImage}
@@ -411,11 +523,186 @@ export function ProductDetailModal({
               </p>
             )}
 
+            {/* Measured or Spoken Spatial Fit Comparison (or Fit unknown when measurement skipped) */}
+            {fitEvaluation && widthVerdictMeta ? (
+              <div
+                data-testid="modal-shelf-width-fit"
+                className={`rounded-lg border p-3.5 space-y-2 text-xs ${widthVerdictMeta.surfaceClass}`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span
+                    data-testid="modal-shelf-width-verdict"
+                    className={`text-sm font-semibold flex items-center gap-1.5 ${widthVerdictMeta.textClass}`}
+                  >
+                    <widthVerdictMeta.Icon className="w-4 h-4 shrink-0" />
+                    <span>{fitEvaluation.verdict}</span>
+                  </span>
+
+                  {spatialLimit ? (
+                    <span className="font-mono-tabular text-[11px] text-[#57534E]">
+                      {spatialLimit.source === "spoken"
+                        ? `Spoken limit ≤ ${spatialLimit.maxInches.toFixed(1)} in (${Math.round(spatialLimit.maxMm)} mm)`
+                        : `${spatialLimit.label} ${spatialLimit.minInches.toFixed(1)}–${spatialLimit.maxInches.toFixed(1)} in (${Math.round(spatialLimit.minMm)}–${Math.round(spatialLimit.maxMm)} mm)`}
+                    </span>
+                  ) : (
+                    <span className="font-mono-tabular text-[11px] text-[#57534E]">
+                      Space unmeasured
+                    </span>
+                  )}
+                </div>
+
+                {spatialLimit && documentedDim && fitEvaluation.requiredWidthInches !== null ? (
+                  <div className="space-y-1 text-[#18181B]">
+                    <p className="font-mono-tabular text-[11px]">
+                      Selected variant {targetAxis}: {documentedDim.widthInches.toFixed(1)} in (
+                      {Math.round(documentedDim.widthMm)} mm · {documentedDim.rawText})
+                      {fitEvaluation.clearanceInches > 0 ? (
+                        <>
+                          {" "}
+                          + {fitEvaluation.clearanceInches.toFixed(2)} in clearance ={" "}
+                          <span className="font-semibold">
+                            {fitEvaluation.requiredWidthInches.toFixed(1)} in required
+                          </span>
+                        </>
+                      ) : null}
+                    </p>
+                    <p className="text-[11px] text-[#57534E]">{fitEvaluation.explanation}</p>
+
+                    <div className="flex flex-wrap items-center gap-3 pt-1 text-[11px]">
+                      {documentedDim.imageIndex &&
+                      documentedDim.imageIndex <= Math.min(galleryMedia.length, 4) ? (
+                        <button
+                          type="button"
+                          data-testid="modal-width-evidence-link"
+                          onClick={() => jumpToGalleryImage(documentedDim.imageIndex!)}
+                          className="font-medium underline underline-offset-2 text-[#18181B] hover:text-[#1F4E3D] whitespace-nowrap"
+                        >
+                          View Neon Photo #{documentedDim.imageIndex} Evidence
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          data-testid="modal-width-evidence-link"
+                          onClick={jumpToListingDetails}
+                          className="font-medium underline underline-offset-2 text-[#18181B] hover:text-[#1F4E3D] whitespace-nowrap"
+                        >
+                          Jump to {documentedDim.sourceLabel}
+                        </button>
+                      )}
+
+                      {safeOfferUrl && (
+                        <a
+                          href={safeOfferUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="underline underline-offset-2 text-[#57534E] hover:text-[#18181B] flex items-center gap-1 whitespace-nowrap"
+                        >
+                          <span>Merchant Listing</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                ) : !spatialLimit ? (
+                  <div className="space-y-2 text-[11px] text-[#57534E]">
+                    <p>{fitEvaluation.explanation}</p>
+                    {onMeasureSpace && (
+                      <button
+                        type="button"
+                        data-testid="modal-measure-space-btn"
+                        onClick={onMeasureSpace}
+                        className="min-h-[34px] px-3 py-1.5 rounded-lg bg-[#18181B] text-white text-xs font-medium hover:bg-[#27272A] inline-flex items-center gap-1.5 whitespace-nowrap"
+                      >
+                        <Ruler className="w-3.5 h-3.5" />
+                        <span>Measure this space</span>
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-1 text-[11px] text-[#57534E]">
+                    <p>
+                      {verifyingEvidence || loading
+                        ? `Checking selected variant options, listing text, and Neon product photos for documented ${targetAxis}...`
+                        : fitEvaluation.explanation}
+                    </p>
+                    {safeOfferUrl && (
+                      <a
+                        href={safeOfferUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        data-testid="modal-width-evidence-link"
+                        className="inline-flex items-center gap-1 font-medium underline underline-offset-2 text-[#18181B] hover:text-[#1F4E3D]"
+                      >
+                        <span>Check dimensions on Merchant Listing</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    )}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="rounded-lg border border-[#E7E5E0] bg-[#FAF9F6] px-3 py-2 text-xs text-[#57534E] flex flex-wrap items-center justify-between gap-2">
+                <span className="flex items-center gap-2">
+                  <Ruler className="w-3.5 h-3.5 text-[#1F4E3D] shrink-0" />
+                  <span>
+                    Checking physical fit? Measure your space or state a size limit.
+                  </span>
+                </span>
+                {onMeasureSpace && (
+                  <button
+                    type="button"
+                    data-testid="modal-measure-space-btn"
+                    onClick={onMeasureSpace}
+                    className="px-2.5 py-1 rounded border border-[#E7E5E0] bg-white text-[#18181B] font-medium hover:border-[#18181B] whitespace-nowrap shrink-0"
+                  >
+                    Measure this space
+                  </button>
+                )}
+              </div>
+            )}
+
             {liveDetails?.messages && liveDetails.messages.length > 0 && (
               <div className="text-xs text-[#57534E] bg-[#F7F6F3] border border-[#E7E5E0] rounded-lg px-3 py-2 space-y-1">
                 {liveDetails.messages.map((m, i) => (
                   <p key={i}>{m.text}</p>
                 ))}
+              </div>
+            )}
+
+            {/* Option Pickers */}
+            {activeProduct.options.length > 0 && (
+              <div className="space-y-3 pt-3 border-t border-[#E7E5E0]">
+                {activeProduct.options.map((opt) => {
+                  const currentVal =
+                    activeSelection.find((s) => s.name === opt.name)?.label ??
+                    opt.values[0];
+                  return (
+                    <div key={opt.name} className="space-y-1.5">
+                      <label className="block text-xs font-medium text-[#57534E]">
+                        {opt.name}: <span className="text-[#18181B]">{currentVal}</span>
+                      </label>
+                      <div className="flex flex-wrap gap-1.5">
+                        {opt.values.map((val) => {
+                          const isSelected = val === currentVal;
+                          return (
+                            <button
+                              key={val}
+                              type="button"
+                              onClick={() => handleOptionChange(opt.name, val)}
+                              className={`min-h-[36px] px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap ${
+                                isSelected
+                                  ? "border-[#18181B] bg-[#18181B] text-white"
+                                  : "border-[#E7E5E0] bg-[#F7F6F3] text-[#18181B] hover:border-[#18181B]"
+                              }`}
+                            >
+                              {val}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
 
@@ -574,60 +861,37 @@ export function ProductDetailModal({
               )}
             </div>
 
-            {/* Option Pickers */}
-            {activeProduct.options.length > 0 && (
-              <div className="space-y-3 pt-3 border-t border-[#E7E5E0]">
-                {activeProduct.options.map((opt) => {
-                  const currentVal =
-                    activeSelection.find((s) => s.name === opt.name)?.label ??
-                    opt.values[0];
-                  return (
-                    <div key={opt.name} className="space-y-1.5">
-                      <label className="block text-xs font-medium text-[#57534E]">
-                        {opt.name}: <span className="text-[#18181B]">{currentVal}</span>
-                      </label>
-                      <div className="flex flex-wrap gap-1.5">
-                        {opt.values.map((val) => {
-                          const isSelected = val === currentVal;
-                          return (
-                            <button
-                              key={val}
-                              type="button"
-                              onClick={() => handleOptionChange(opt.name, val)}
-                              className={`min-h-[36px] px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap ${
-                                isSelected
-                                  ? "border-[#18181B] bg-[#18181B] text-white"
-                                  : "border-[#E7E5E0] bg-[#F7F6F3] text-[#18181B] hover:border-[#18181B]"
-                              }`}
-                            >
-                              {val}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {activeProduct.descriptionText && (
-              <div className="pt-3 border-t border-[#E7E5E0]">
+            {(activeProduct.descriptionText || activeProduct.features.length > 0) && (
+              <div
+                ref={listingSectionRef}
+                data-testid="modal-listing-evidence-section"
+                className={`pt-3 border-t border-[#E7E5E0] rounded-lg transition-colors ${
+                  highlightListingEvidence
+                    ? "bg-[#FAF9F6] p-3 ring-1 ring-[#1F4E3D]"
+                    : ""
+                }`}
+              >
                 <p className="text-xs font-semibold text-[#18181B] mb-1.5">
                   Merchant Listing Details
                 </p>
-                <p className="text-sm text-[#57534E] leading-relaxed whitespace-pre-line max-h-40 overflow-y-auto">
-                  {activeProduct.descriptionText}
-                </p>
+                {documentedDim && documentedDim.imageIndex === null && (
+                  <p className="text-xs text-[#14532D] font-mono-tabular mb-1.5">
+                    Matched {targetAxis} citation: &ldquo;{documentedDim.citationText}&rdquo;
+                  </p>
+                )}
+                {activeProduct.descriptionText && (
+                  <p className="text-sm text-[#57534E] leading-relaxed whitespace-pre-line max-h-40 overflow-y-auto">
+                    {activeProduct.descriptionText}
+                  </p>
+                )}
+                {activeProduct.features.length > 0 && (
+                  <ul className="pt-2 space-y-1 text-xs text-[#57534E] list-disc list-inside">
+                    {activeProduct.features.slice(0, 6).map((feat, idx) => (
+                      <li key={idx}>{feat}</li>
+                    ))}
+                  </ul>
+                )}
               </div>
-            )}
-
-            {activeProduct.features.length > 0 && (
-              <ul className="pt-2 space-y-1 text-xs text-[#57534E] list-disc list-inside">
-                {activeProduct.features.slice(0, 4).map((feat, idx) => (
-                  <li key={idx}>{feat}</li>
-                ))}
-              </ul>
             )}
           </div>
 

@@ -100,23 +100,22 @@ Build strictly in phases. Keep the app runnable, typed, tested, and verified on 
 - [x] **Dual Gemini 4 Model Separation (`Hydrogen` + `Neon`)**:
   - **`gemini-4-hydrogen`** (`server/hydrogenAgent.ts`, `ThinkingLevel.LOW`) extracts structured spoken shopping intent, budget, required/excluded/preferred/functional attributes, dimensional requirements, and mid-sentence self-corrections.
   - **`gemini-4-neon`** (`server/neonAgent.ts`, `ThinkingLevel.LOW`) runs concurrently with Hydrogen on live `1 FPS` camera frames for spatial perception (target space, existing objects, style, materials, usable region, calibration status, conservative dimension ranges) AND extracts multimodal product photo evidence (annotated size diagrams, dimension charts, material callouts in gallery images 2–4) with SSRF-hardened image fetching and in-session caching.
-- [ ] **Batch Candidate Verification Pipeline**:
-  - Staged multi-product pipeline across 30–50 Shop MCP candidates: deterministic filtering → listing text extraction → bounded-concurrency Neon image inspection → transparent ranking & near-miss presentation when zero candidates pass all hard constraints.
-- [ ] **Signature Side-by-Side Comparison View**:
-  - Desktop 2-column comparison (Mobile segmented toggle) contrasting **Standard Shopify Search** (with detected constraint violations flagged) vs. **SceneCart Verified Recommendations**.
+- [x] **Batch Candidate Verification Pipeline (Top 5 Real Shopify Results)**:
+  - Bounded-concurrency (`MAX_CONCURRENT_SHELF_CHECKS = 2`) verification across the top 5 real Shop MCP results (`get_product` + conditional `gemini-4-neon` product photo diagram inspection), discarding stale runs via `AbortController` + monotonic `runId`.
+- [x] **Standard vs. SceneCart Ranking Toggle**:
+  - Segmented **`Standard` / `SceneCart`** toggle preserving 100% of original Shop MCP ranking in `Standard` mode and stable-sorting verified matches (`Width fits` / `Height fits` / `Depth fits` → `Too close to confirm` → `Unknown` → `Too wide` / `Too tall` / `Too deep`) in `SceneCart` mode.
 - [x] **Product Evidence Drawer/Modal**:
-  - Expanded `ProductDetailModal` to show `VERIFIED` / `UNCERTAIN` / `REJECTED` status, per-constraint `PASS` / `FAIL` / `UNKNOWN` checks, extracted dimensions/materials (`directly_observed` vs `inferred`), clickable `Photo #N` gallery source jumps, and spatial compatibility notes.
+  - Expanded `ProductDetailModal` to show `VERIFIED` / `UNCERTAIN` / `REJECTED` status, measured/spoken variant dimension fit (`Width fits`, `Too wide`, `Too close to confirm`, `Width unknown`, and `Fit unknown` when measurement is skipped), clickable `Neon Photo #N` or `Merchant listing` evidence links, and live variant switching.
 
 ### Phase 3 — Real Shopify Purchase Flow
-- [ ] Variant & option combination selection verified live via `get_product`.
+- [x] Variant & option combination selection verified live via `get_product`.
 - [ ] Add Shop MCP cart/checkout capabilities (when explicitly enabled in scope): real cart creation, quantity updates, subtotals, merchant-specific checkout handoff when multi-merchant unified checkout is unsupported.
 - [ ] Explicit user confirmation required before any checkout/purchase action; never fabricate cart IDs, checkout URLs, or inventory.
 
 ### Phase 4 — Reference-Based Spatial Calibration & Scale-Aware Preview
-- [ ] **Reference-Object Calibration Workflow** (no LiDAR required):
-  - Support standard credit-card size (`85.60 mm × 53.98 mm` — encourage blank cards), US Letter (`8.5 × 11 in`), or custom dimensions.
-  - Corner adjustment + target placement region marking + deterministic homography/planar geometry returning conservative ranges (e.g., `26–30 in`, using lower bound minus clearance margin for fit checks).
-  - Explicitly mark depth/fit as `UNCERTAIN` when calibration is missing or single-view depth is ambiguous.
+- [x] **Opt-In `"Measure this space"` Reference-Card Calibration + Spoken Limit Shortcut** (no LiDAR required):
+  - Keeps camera-and-voice shopping as default across all product categories; offers **`Measure this space`** manually or when physical fit is requested, or uses spoken limits directly (e.g., *"at most 20 inches wide"*) while skipping the card step.
+  - Freezes a live camera frame, marks 4 corners of an `85.60 × 53.98 mm` card and 2 coplanar span endpoints (`Shelf opening`, `Desk gap`, `Wall width`, `Height clearance`, `Surface depth`), computes planar homography + 95% tap-uncertainty range, supports Undo/Retake/Invalid-tap rejection, and displays **`Fit unknown`** whenever measurement is skipped.
 - [ ] **Calibrated 2D Placement Preview**:
   - Priority: planar wall art draggable aspect-ratio-locked overlay on captured wall frame.
   - Approximate placement preview for desks/shelves with clear depth/perspective limitation disclosure.

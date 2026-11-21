@@ -483,9 +483,10 @@ Non-budget constraints to verify:\n${JSON.stringify(nonBudgetConstraints)}
 
 Instructions for Neon Product Evidence Extraction:
 1. Inspect structured metadata, description, AND attached product photographs (especially annotated dimension diagrams, measurement callouts, size charts, and material labels).
-2. Do NOT confuse shipping/package dimensions with actual product dimensions.
-3. Do NOT infer mandatory material composition solely from shiny/metallic visual appearance—if neither text nor image text confirms a mandatory material or drill-free requirement, mark verdict as UNKNOWN.
-4. For every extracted attribute or image-based constraint check, set imageIndex to the exact Attached Product Gallery Image # (e.g. 2) when sourced from a photo, or 0 when sourced from listing text.`,
+2. Whenever the selected variant's dimensions are explicitly documented in listing text or a product photo diagram, extract separate attributes named "Product Width" (or diameter for circular footprints), "Product Height", and/or "Product Depth" with numeric extractedValue (e.g. "23.6" or "140"), explicit unit ("in", "mm", or "cm"), observationType "directly_observed", and exact imageIndex (1-4 if from a photo, 0 if from text). Never apply an unselected variant's dimensions.
+3. Do NOT confuse shipping/package dimensions with actual product dimensions.
+4. Do NOT infer mandatory material composition or dimensions from uncalibrated visual appearance—if neither text nor image text confirms a mandatory requirement or dimension, omit or mark verdict as UNKNOWN.
+5. For every extracted attribute or image-based constraint check, set imageIndex to the exact Attached Product Gallery Image # (e.g. 2) when sourced from a photo, or 0 when sourced from listing text.`,
   });
 
   const startedAt = performance.now();
