@@ -114,7 +114,7 @@ async function startServer() {
 
   app.post("/api/ramble/interpret", async (req, res) => {
     try {
-      const { imageBase64, mimeType, rambleText } = req.body as {
+      const { imageBase64, mimeType, rambleText } = (req.body ?? {}) as {
         imageBase64?: string;
         mimeType?: string;
         rambleText?: string;
@@ -129,10 +129,36 @@ async function startServer() {
       });
       res.json(interpretation);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Could not interpret space.";
-      const status = msg.includes("GEMINI_API_KEY") ? 503 : 400;
-      res.status(status).json({ error: msg });
+      const body = (err as { body?: string })?.body;
+      const rawMsg = body || (err instanceof Error ? err.message : "Could not interpret space.");
+
+      let friendly = rawMsg;
+      if (rawMsg.includes("API_KEY_INVALID") || rawMsg.includes("PERMISSION_DENIED")) {
+        friendly =
+          "Gemini API key in Settings > Secrets is invalid or not set. Update GEMINI_API_KEY there, or search Shop MCP directly below.";
+        console.warn("[/api/ramble/interpret] Gemini API key invalid or missing.");
+      } else if (rawMsg.includes("RESOURCE_EXHAUSTED")) {
+        friendly =
+          "Gemini API quota exceeded. Check billing/quota in Settings > Secrets.";
+        console.warn("[/api/ramble/interpret] Gemini API quota exceeded.");
+      } else if (rawMsg.includes("NOT_FOUND")) {
+        friendly = "Requested Gemini model is unavailable for this API key.";
+        console.warn("[/api/ramble/interpret] Requested Gemini model not found.");
+      } else {
+        console.error("[/api/ramble/interpret] error:", rawMsg);
+      }
+
+      const status = rawMsg.includes("GEMINI_API_KEY") ? 503 : 400;
+      res.status(status).json({ error: friendly });
     }
+  });
+
+  // Never let any /api/* request fall through to Vite or the SPA HTML fallback
+  app.use("/api", (req, res) => {
+    res.status(404).json({
+      error: `API route not found: ${req.method} ${req.originalUrl}`,
+      code: "NOT_FOUND",
+    });
   });
 
   if (process.env.NODE_ENV !== "production") {
@@ -149,6 +175,29 @@ async function startServer() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
+
+  // Return JSON instead of Express's default HTML error page for API middleware errors (e.g., 413, bad JSON)
+  app.use(
+    (
+      err: { status?: number; statusCode?: number; type?: string; message?: string },
+      req: express.Request,
+      res: express.Response,
+      next: express.NextFunction,
+    ) => {
+      if (res.headersSent) {
+        return next(err);
+      }
+      const status = err.statusCode || err.status || 500;
+      const message =
+        err.type === "entity.too.large"
+          ? "Uploaded camera frame is too large. Try again or disable camera."
+          : err.message || "Unexpected server error.";
+      if (req.originalUrl.startsWith("/api")) {
+        return res.status(status).json({ error: message, code: err.type || "SERVER_ERROR" });
+      }
+      return res.status(status).send(message);
+    },
+  );
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server listening on http://0.0.0.0:${PORT}`);

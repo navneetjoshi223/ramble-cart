@@ -6,6 +6,7 @@ import type {
   NormalizedProduct,
 } from "../types";
 import { ProductImage } from "./ProductImage";
+import { safeFetchJson } from "../utils/safeFetchJson";
 
 interface ProductDetailModalProps {
   product: NormalizedProduct | null;
@@ -64,7 +65,7 @@ export function ProductDetailModal({
     setError(null);
 
     try {
-      const res = await fetch("/api/shop/product", {
+      const data = await safeFetchJson<GetProductResult>("/api/shop/product", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -75,11 +76,7 @@ export function ProductDetailModal({
         }),
         signal: controller.signal,
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Could not load product combination details.");
-      }
-      setLiveDetails(data as GetProductResult);
+      setLiveDetails(data);
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
       setError(err instanceof Error ? err.message : "Failed to confirm product details.");
@@ -166,9 +163,9 @@ export function ProductDetailModal({
           )}
         </div>
 
-        <div className="p-6 md:p-8 flex flex-col justify-between gap-6">
-          <div className="space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[#57534E]">
+        <div className="p-6 md:p-7 flex flex-col justify-between gap-5">
+          <div className="space-y-3.5">
+            <div className="flex flex-wrap items-center justify-between gap-2 pr-12 text-xs text-[#57534E]">
               <span className="uppercase tracking-wider">
                 {seller?.name ?? "Independent Merchant"}
               </span>

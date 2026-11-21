@@ -18,6 +18,7 @@ import type {
 } from "./types";
 import { ProductImage } from "./components/ProductImage";
 import { ProductDetailModal } from "./components/ProductDetailModal";
+import { safeFetchJson } from "./utils/safeFetchJson";
 
 const SAMPLE_QUERIES = [
   "ceramic coffee dripper",
@@ -109,7 +110,7 @@ export function App() {
         : getMaxPriceMinor(maxPriceInput, currency);
 
     try {
-      const res = await fetch("/api/shop/search", {
+      const typed = await safeFetchJson<SearchCatalogResult>("/api/shop/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -123,13 +124,6 @@ export function App() {
         }),
         signal: controller.signal,
       });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Shop MCP search failed.");
-      }
-
-      const typed = data as SearchCatalogResult;
       if (options.append && searchResult) {
         setSearchResult({
           ...typed,
@@ -255,17 +249,17 @@ export function App() {
     if (cameraActive && videoRef.current && videoRef.current.videoWidth > 0) {
       const video = videoRef.current;
       const canvas = document.createElement("canvas");
-      canvas.width = 768;
-      canvas.height = Math.round((video.videoHeight / video.videoWidth) * 768) || 432;
+      canvas.width = 640;
+      canvas.height = Math.round((video.videoHeight / video.videoWidth) * 640) || 360;
       const ctx = canvas.getContext("2d");
       if (ctx) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        imageBase64 = canvas.toDataURL("image/jpeg", 0.8).split(",")[1];
+        imageBase64 = canvas.toDataURL("image/jpeg", 0.7).split(",")[1];
       }
     }
 
     try {
-      const res = await fetch("/api/ramble/interpret", {
+      const parsed = await safeFetchJson<SpaceQueryInterpretation>("/api/ramble/interpret", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -274,11 +268,6 @@ export function App() {
           rambleText: rambleText.trim(),
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Could not interpret space request.");
-      }
-      const parsed = data as SpaceQueryInterpretation;
       setInterpretation(parsed);
       setQuery(parsed.searchQuery);
       if (parsed.maxPriceUsd) {
@@ -307,7 +296,7 @@ export function App() {
   return (
     <div className="min-h-screen flex flex-col bg-[#F7F6F3] text-[#18181B]">
       {/* 3-Zone Top Bar */}
-      <header className="sticky top-0 z-40 bg-[#F7F6F3]/95 backdrop-blur-sm border-b border-[#E7E5E0]">
+      <header className="sticky top-0 z-40 bg-[#F7F6F3] border-b border-[#E7E5E0]">
         <div className="max-w-[1320px] mx-auto px-5 sm:px-8 h-16 flex items-center justify-between gap-8">
           <a
             href="#search"
@@ -446,9 +435,21 @@ export function App() {
                   )}
 
                   {interpretError && (
-                    <p className="text-xs text-[#991B1B] bg-[#FEF2F2] border border-[#FECACA] rounded-lg px-3 py-2">
-                      {interpretError}
-                    </p>
+                    <div className="text-xs text-[#991B1B] bg-[#FEF2F2] border border-[#FECACA] rounded-lg px-3 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <span>{interpretError}</span>
+                      {rambleText.trim() && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setQuery(rambleText.trim());
+                            runSearch(rambleText.trim());
+                          }}
+                          className="px-2.5 py-1.5 rounded bg-[#18181B] text-white text-xs font-medium whitespace-nowrap shrink-0 self-start sm:self-auto"
+                        >
+                          Search Shop MCP Directly
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
 
