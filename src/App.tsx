@@ -1,9 +1,7 @@
-import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
-  Camera,
+  Video,
   ExternalLink,
-  Mic,
-  MicOff,
   Search,
   VideoOff,
   Clock,
@@ -11,8 +9,7 @@ import {
   AlertTriangle,
   Sparkles,
   RefreshCw,
-  Upload,
-  X,
+  Radio,
 } from "lucide-react";
 import type {
   NormalizedProduct,
@@ -21,6 +18,7 @@ import type {
 } from "./types";
 import { ProductImage } from "./components/ProductImage";
 import { ProductDetailModal } from "./components/ProductDetailModal";
+import { DictationButton } from "./components/DictationButton";
 import { safeFetchJson } from "./utils/safeFetchJson";
 
 const SAMPLE_QUERIES = [
@@ -51,32 +49,42 @@ export function App() {
   const [searchResult, setSearchResult] = useState<SearchCatalogResult | null>(null);
   const [inspectedProduct, setInspectedProduct] = useState<NormalizedProduct | null>(null);
 
-  // Minimal Phase 1 Space Camera & Voice Capture (optional helper for Shop MCP search)
+  // Live Video & Voice Stream Input for Shop MCP search
   const [spaceOpen, setSpaceOpen] = useState(true);
   const [cameraActive, setCameraActive] = useState(false);
   const [facingMode, setFacingMode] = useState<"environment" | "user">("environment");
-  const [capturedImage, setCapturedImage] = useState<{
-    dataUrl: string;
-    base64: string;
-    mimeType: string;
-  } | null>(null);
+  const [liveFrameCount, setLiveFrameCount] = useState(0);
+  const [liveAutoSync, setLiveAutoSync] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [rambleText, setRambleText] = useState("");
   const [dictating, setDictating] = useState(false);
+  const [autoDictateEnabled, setAutoDictateEnabled] = useState(true);
   const [interpreting, setInterpreting] = useState(false);
   const [interpretation, setInterpretation] = useState<SpaceQueryInterpretation | null>(null);
   const [interpretError, setInterpretError] = useState<string | null>(null);
 
   const searchAbortRef = useRef<AbortController | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
-  const recognitionRef = useRef<{ stop: () => void } | null>(null);
+  const videoFramesRef = useRef<string[]>([]);
+  const rambleTextRef = useRef("");
+  const lastAutoInterpretedTextRef = useRef("");
+  const speechPauseTimerRef = useRef<number | null>(null);
+  const autoDictateEnabledRef = useRef(true);
+  const dictatingRef = useRef(false);
+  const interpretingRef = useRef(false);
+  const recognitionRef = useRef<{ start: () => void; stop: () => void } | null>(null);
 
   useEffect(() => {
     runSearch("ceramic coffee dripper");
+    startAutoDictation(true);
     return () => {
       searchAbortRef.current?.abort();
+      autoDictateEnabledRef.current = false;
+      if (speechPauseTimerRef.current) {
+        window.clearTimeout(speechPauseTimerRef.current);
+      }
+      recognitionRef.current?.stop();
       stopCamera();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -163,24 +171,75 @@ export function App() {
   }
 
   useEffect(() => {
+    rambleTextRef.current = rambleText;
+  }, [rambleText]);
+
+  useEffect(() => {
     if (cameraActive && videoRef.current && cameraStreamRef.current) {
       videoRef.current.srcObject = cameraStreamRef.current;
       videoRef.current.play().catch(() => {});
     }
   }, [cameraActive, spaceOpen]);
 
+  function sampleCurrentVideoFrame(): string | null {
+    const video = videoRef.current;
+    if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
+      return null;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = 640;
+    canvas.height = Math.round((video.videoHeight / video.videoWidth) * 640) || 360;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.72);
+    const base64 = dataUrl.split(",")[1] || "";
+    if (!base64) return null;
+
+    const nextBuffer = [...videoFramesRef.current.slice(-3), base64];
+    videoFramesRef.current = nextBuffer;
+    setLiveFrameCount(nextBuffer.length);
+    return base64;
+  }
+
+  // Continuous 1 FPS live video stream sampler while camera is active
+  useEffect(() => {
+    if (!cameraActive) {
+      videoFramesRef.current = [];
+      setLiveFrameCount(0);
+      return;
+    }
+    const interval = window.setInterval(() => {
+      sampleCurrentVideoFrame();
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [cameraActive]);
+
+  // Optional continuous Live Auto-Search sync from rolling 1 FPS video stream
+  useEffect(() => {
+    if (!cameraActive || !liveAutoSync) return;
+    const syncTimer = window.setInterval(() => {
+      if (!interpretingRef.current && videoFramesRef.current.length > 0) {
+        void handleInterpretAndSearch();
+      }
+    }, 5000);
+    return () => window.clearInterval(syncTimer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraActive, liveAutoSync]);
+
   async function startCamera(preferredFacing: "environment" | "user" = facingMode) {
     setCameraError(null);
-    setCapturedImage(null);
+
+    // Ensure auto-dictation starts on this user gesture
+    autoDictateEnabledRef.current = true;
+    setAutoDictateEnabled(true);
+    startAutoDictation(true);
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setCameraError(
-        "Live camera stream is not supported in this browser context. Use 'Snap / Upload Photo' below.",
-      );
+      setCameraError("Live video input is not supported in this browser context.");
       return;
     }
 
-    // Stop any existing tracks before opening a new stream
     if (cameraStreamRef.current) {
       cameraStreamRef.current.getTracks().forEach((t) => t.stop());
       cameraStreamRef.current = null;
@@ -194,11 +253,11 @@ export function App() {
             facingMode: { ideal: preferredFacing },
             width: { ideal: 1280 },
             height: { ideal: 720 },
+            frameRate: { ideal: 24 },
           },
           audio: false,
         });
       } catch {
-        // Fallback to any available video input device
         stream = await navigator.mediaDevices.getUserMedia({
           video: true,
           audio: false,
@@ -206,6 +265,8 @@ export function App() {
       }
 
       cameraStreamRef.current = stream;
+      videoFramesRef.current = [];
+      setLiveFrameCount(0);
       setFacingMode(preferredFacing);
       setCameraActive(true);
       if (videoRef.current) {
@@ -215,8 +276,8 @@ export function App() {
     } catch (err) {
       setCameraError(
         err instanceof Error
-          ? `Live camera blocked (${err.message}). Use 'Snap / Upload Photo' instead.`
-          : "Camera permission denied. Use 'Snap / Upload Photo' instead.",
+          ? `Live video unavailable (${err.message}). Check camera permissions.`
+          : "Camera permission denied for live video.",
       );
       setCameraActive(false);
     }
@@ -230,6 +291,9 @@ export function App() {
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
+    videoFramesRef.current = [];
+    setLiveFrameCount(0);
+    setLiveAutoSync(false);
     setCameraActive(false);
   }
 
@@ -238,65 +302,7 @@ export function App() {
     startCamera(nextFacing);
   }
 
-  function captureVideoFrame(): { dataUrl: string; base64: string; mimeType: string } | null {
-    const video = videoRef.current;
-    if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
-      return null;
-    }
-    const canvas = document.createElement("canvas");
-    canvas.width = 640;
-    canvas.height = Math.round((video.videoHeight / video.videoWidth) * 640) || 360;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return null;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const dataUrl = canvas.toDataURL("image/jpeg", 0.75);
-    const base64 = dataUrl.split(",")[1] || "";
-    if (!base64) return null;
-    const snap = { dataUrl, base64, mimeType: "image/jpeg" };
-    setCapturedImage(snap);
-    return snap;
-  }
-
-  function handlePhotoFileChange(e: ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setCameraError(null);
-
-    const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement("canvas");
-        const maxDim = 640;
-        const scale = Math.min(1, maxDim / Math.max(img.width || 640, img.height || 640));
-        canvas.width = Math.max(1, Math.round(img.width * scale));
-        canvas.height = Math.max(1, Math.round(img.height * scale));
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          const dataUrl = canvas.toDataURL("image/jpeg", 0.78);
-          const base64 = dataUrl.split(",")[1] || "";
-          if (base64) {
-            setCapturedImage({ dataUrl, base64, mimeType: "image/jpeg" });
-            stopCamera();
-          }
-        }
-      };
-      if (typeof reader.result === "string") {
-        img.src = reader.result;
-      }
-    };
-    reader.readAsDataURL(file);
-    e.target.value = "";
-  }
-
-  function toggleDictation() {
-    if (dictating && recognitionRef.current) {
-      recognitionRef.current.stop();
-      setDictating(false);
-      return;
-    }
-
+  function startAutoDictation(silentIfUnsupported = false) {
     const SpeechRec =
       (
         window as unknown as {
@@ -308,50 +314,133 @@ export function App() {
         .webkitSpeechRecognition;
 
     if (!SpeechRec) {
-      setInterpretError("Speech dictation is unavailable in this browser. Type your request below.");
+      if (!silentIfUnsupported) {
+        setInterpretError("Speech dictation is unavailable in this browser. Type your request below.");
+      }
       return;
+    }
+
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {
+        // ignore if already stopped
+      }
     }
 
     const rec = new SpeechRec() as {
       continuous: boolean;
       interimResults: boolean;
       lang: string;
-      onresult: (e: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void;
-      onerror: () => void;
+      onstart: (() => void) | null;
+      onresult: (e: {
+        results: ArrayLike<{ isFinal?: boolean; 0: { transcript: string } }>;
+      }) => void;
+      onerror: (e: { error?: string }) => void;
       onend: () => void;
       start: () => void;
       stop: () => void;
     };
-    rec.continuous = false;
+    rec.continuous = true;
     rec.interimResults = true;
     rec.lang = "en-US";
+    rec.onstart = () => {
+      dictatingRef.current = true;
+      setDictating(true);
+    };
     rec.onresult = (event) => {
       let text = "";
       for (let i = 0; i < event.results.length; i++) {
         text += event.results[i][0]?.transcript ?? "";
       }
-      if (text.trim()) setRambleText(text.trim());
+      const cleaned = text.trim();
+      if (!cleaned) return;
+
+      rambleTextRef.current = cleaned;
+      setRambleText(cleaned);
+
+      // Automatically interpret & search when the user pauses speaking for 1.4s
+      if (speechPauseTimerRef.current) {
+        window.clearTimeout(speechPauseTimerRef.current);
+      }
+      speechPauseTimerRef.current = window.setTimeout(() => {
+        const latest = rambleTextRef.current.trim();
+        if (
+          latest &&
+          latest !== lastAutoInterpretedTextRef.current &&
+          !interpretingRef.current
+        ) {
+          lastAutoInterpretedTextRef.current = latest;
+          void handleInterpretAndSearch();
+        }
+      }, 1400);
     };
-    rec.onerror = () => setDictating(false);
-    rec.onend = () => setDictating(false);
+    rec.onerror = (event) => {
+      dictatingRef.current = false;
+      setDictating(false);
+      if (event.error === "service-not-allowed") {
+        autoDictateEnabledRef.current = false;
+        setAutoDictateEnabled(false);
+      }
+    };
+    rec.onend = () => {
+      dictatingRef.current = false;
+      if (autoDictateEnabledRef.current) {
+        window.setTimeout(() => {
+          if (!autoDictateEnabledRef.current || dictatingRef.current) return;
+          try {
+            rec.start();
+          } catch {
+            setDictating(false);
+          }
+        }, 300);
+      } else {
+        setDictating(false);
+      }
+    };
+
     recognitionRef.current = rec;
-    setDictating(true);
-    rec.start();
+    autoDictateEnabledRef.current = true;
+    setAutoDictateEnabled(true);
+    try {
+      rec.start();
+      dictatingRef.current = true;
+      setDictating(true);
+    } catch {
+      dictatingRef.current = false;
+      setDictating(false);
+    }
+  }
+
+  function toggleDictation() {
+    if (autoDictateEnabled && dictating) {
+      autoDictateEnabledRef.current = false;
+      setAutoDictateEnabled(false);
+      if (speechPauseTimerRef.current) {
+        window.clearTimeout(speechPauseTimerRef.current);
+      }
+      recognitionRef.current?.stop();
+      setDictating(false);
+      return;
+    }
+    startAutoDictation(false);
   }
 
   async function handleInterpretAndSearch() {
-    let activeSnap = capturedImage;
-    if (!activeSnap && cameraActive) {
-      activeSnap = captureVideoFrame();
+    if (cameraActive) {
+      sampleCurrentVideoFrame();
     }
+    const framesToSend = [...videoFramesRef.current];
+    const currentText = rambleTextRef.current.trim();
 
-    if (!rambleText.trim() && !activeSnap) {
+    if (!currentText && framesToSend.length === 0) {
       setInterpretError(
-        "Enable the camera, snap/upload a photo, or describe what fits your space first.",
+        "Start live video or speak/type what fits your space first.",
       );
       return;
     }
 
+    interpretingRef.current = true;
     setInterpreting(true);
     setInterpretError(null);
 
@@ -360,9 +449,9 @@ export function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          imageBase64: activeSnap?.base64,
-          mimeType: activeSnap?.mimeType ?? "image/jpeg",
-          rambleText: rambleText.trim(),
+          videoFrames: framesToSend,
+          mimeType: "image/jpeg",
+          rambleText: currentText,
         }),
       });
       setInterpretation(parsed);
@@ -375,9 +464,10 @@ export function App() {
       });
     } catch (err) {
       setInterpretError(
-        err instanceof Error ? err.message : "Space interpretation failed.",
+        err instanceof Error ? err.message : "Live video interpretation failed.",
       );
     } finally {
+      interpretingRef.current = false;
       setInterpreting(false);
     }
   }
@@ -434,10 +524,7 @@ export function App() {
               <p className="text-xs font-medium uppercase tracking-widest text-[#57534E] mb-2">
                 Shop MCP · Stateless Catalog Discovery
               </p>
-              <h1
-                className="font-display text-3xl sm:text-4xl font-medium text-[#18181B] leading-tight"
-                style={{ textWrap: "balance" }}
-              >
+              <h1 className="font-display text-3xl sm:text-4xl font-medium text-[#18181B] leading-tight text-balance">
                 Search products from millions of Shopify merchants.
               </h1>
             </div>
@@ -447,12 +534,12 @@ export function App() {
               onClick={() => setSpaceOpen((v) => !v)}
               className="min-h-[44px] px-4 py-2 rounded-lg border border-[#E7E5E0] bg-white text-xs font-medium text-[#18181B] hover:border-[#18181B] transition-colors flex items-center gap-2 self-start md:self-auto whitespace-nowrap shrink-0"
             >
-              <Camera className="w-4 h-4 text-[#1F4E3D]" />
-              <span>{spaceOpen ? "Hide Camera & Voice" : "Camera & Voice Input"}</span>
+              <Video className="w-4 h-4 text-[#1F4E3D]" />
+              <span>{spaceOpen ? "Hide Live Video & Voice" : "Live Video & Voice Input"}</span>
             </button>
           </div>
 
-          {/* Optional Minimal Camera & Voice Panel */}
+          {/* Live Video & Voice Stream Panel */}
           {spaceOpen && (
             <div className="bg-white rounded-xl border border-[#E7E5E0] p-5 grid grid-cols-1 lg:grid-cols-12 gap-6">
               <div className="lg:col-span-5 space-y-3">
@@ -463,50 +550,25 @@ export function App() {
                     muted
                     autoPlay
                     className={
-                      cameraActive && !capturedImage
+                      cameraActive
                         ? "w-full h-full object-cover"
                         : "hidden"
                     }
                   />
-                  {capturedImage ? (
-                    <div className="relative w-full h-full">
-                      <img
-                        src={capturedImage.dataUrl}
-                        alt="Captured space frame"
-                        className="w-full h-full object-cover"
-                      />
-                      <span className="absolute bottom-2 left-2 px-2 py-0.5 rounded bg-black/75 text-white text-[11px] font-medium">
-                        Frame ready for Gemini
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setCapturedImage(null)}
-                        aria-label="Clear captured photo"
-                        className="absolute top-2 right-2 min-h-[32px] px-2.5 py-1 rounded-md bg-black/75 text-white text-xs font-medium hover:bg-black flex items-center gap-1"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                        <span>Clear</span>
-                      </button>
+                  {cameraActive ? (
+                    <div className="absolute top-2.5 left-2.5 px-2.5 py-1 rounded-md bg-black/75 text-white text-[11px] font-mono-tabular flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-[#EF4444] animate-pulse" />
+                      <span>LIVE VIDEO · 1 FPS ({liveFrameCount}f window)</span>
                     </div>
-                  ) : !cameraActive ? (
+                  ) : (
                     <div className="w-full h-full flex flex-col items-center justify-center text-[#A8A29E] px-4 text-center">
-                      <Camera className="w-7 h-7 mb-2 opacity-70" />
+                      <Video className="w-7 h-7 mb-2 opacity-70" />
                       <p className="text-xs">
-                        Enable live camera or snap/upload a photo of your desk, shelf, or item.
+                        Start live video to stream your space continuously at 1 FPS while you talk.
                       </p>
                     </div>
-                  ) : null}
+                  )}
                 </div>
-
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  onChange={handlePhotoFileChange}
-                  className="hidden"
-                  aria-label="Upload or capture space photo"
-                />
 
                 <div className="flex flex-wrap items-center gap-2">
                   <button
@@ -514,19 +576,12 @@ export function App() {
                     onClick={() => (cameraActive ? stopCamera() : startCamera())}
                     className="min-h-[40px] px-3.5 py-2 rounded-lg bg-[#18181B] text-white text-xs font-medium flex items-center gap-1.5"
                   >
-                    {cameraActive ? <VideoOff className="w-3.5 h-3.5" /> : <Camera className="w-3.5 h-3.5" />}
-                    <span>{cameraActive ? "Stop Camera" : "Enable Camera"}</span>
+                    {cameraActive ? <VideoOff className="w-3.5 h-3.5" /> : <Video className="w-3.5 h-3.5" />}
+                    <span>{cameraActive ? "Stop Live Video" : "Start Live Video"}</span>
                   </button>
 
                   {cameraActive && (
                     <>
-                      <button
-                        type="button"
-                        onClick={captureVideoFrame}
-                        className="min-h-[40px] px-3 py-2 rounded-lg border border-[#1F4E3D] bg-[#F7F6F3] text-[#1F4E3D] text-xs font-medium hover:bg-[#1F4E3D] hover:text-white transition-colors"
-                      >
-                        Snap Frame
-                      </button>
                       <button
                         type="button"
                         onClick={flipCamera}
@@ -534,19 +589,23 @@ export function App() {
                         className="min-h-[40px] px-3 py-2 rounded-lg border border-[#E7E5E0] bg-white text-[#18181B] text-xs font-medium hover:border-[#18181B] flex items-center gap-1"
                       >
                         <RefreshCw className="w-3.5 h-3.5" />
-                        <span>Flip</span>
+                        <span>Flip Camera</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setLiveAutoSync((v) => !v)}
+                        className={`min-h-[40px] px-3 py-2 rounded-lg border text-xs font-medium flex items-center gap-1.5 transition-colors ${
+                          liveAutoSync
+                            ? "border-[#1F4E3D] bg-[#1F4E3D] text-white"
+                            : "border-[#E7E5E0] bg-white text-[#18181B] hover:border-[#18181B]"
+                        }`}
+                      >
+                        <Radio className="w-3.5 h-3.5" />
+                        <span>{liveAutoSync ? "Live Auto-Sync: ON" : "Live Auto-Sync: OFF"}</span>
                       </button>
                     </>
                   )}
-
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="min-h-[40px] px-3 py-2 rounded-lg border border-[#E7E5E0] bg-white text-[#18181B] text-xs font-medium hover:border-[#18181B] flex items-center gap-1.5"
-                  >
-                    <Upload className="w-3.5 h-3.5" />
-                    <span>Snap / Upload Photo</span>
-                  </button>
                 </div>
 
                 {cameraError && (
@@ -560,25 +619,22 @@ export function App() {
                     <label htmlFor="space-ramble" className="text-sm font-semibold text-[#18181B]">
                       Describe what fits your space
                     </label>
-                    <button
-                      type="button"
-                      onClick={toggleDictation}
-                      className={`min-h-[36px] px-3 py-1.5 rounded-lg border text-xs font-medium flex items-center gap-1.5 ${
-                        dictating
-                          ? "border-[#991B1B] bg-[#FEF2F2] text-[#991B1B]"
-                          : "border-[#E7E5E0] text-[#18181B]"
-                      }`}
-                    >
-                      {dictating ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
-                      <span>{dictating ? "Stop Mic" : "Dictate"}</span>
-                    </button>
+                    <DictationButton
+                      dictating={dictating}
+                      onToggle={toggleDictation}
+                    />
                   </div>
                   <textarea
                     id="space-ramble"
                     rows={2}
                     value={rambleText}
+                    onFocus={() => {
+                      if (autoDictateEnabledRef.current && !dictating) {
+                        startAutoDictation(true);
+                      }
+                    }}
                     onChange={(e) => setRambleText(e.target.value)}
-                    placeholder="e.g. Need a monitor stand under $50. Actually forget wood, matte black metal."
+                    placeholder="Speak freely while panning your camera—auto-dictation transcribes and searches when you pause."
                     className="w-full rounded-lg border border-[#E7E5E0] bg-[#F7F6F3] px-3.5 py-2.5 text-sm focus:bg-white focus:outline-none focus:border-[#1F4E3D]"
                   />
 
@@ -624,7 +680,11 @@ export function App() {
                   className="min-h-[44px] px-4 py-2.5 rounded-lg bg-[#1F4E3D] text-white text-xs font-medium hover:bg-[#173B2E] disabled:opacity-60 flex items-center justify-center gap-2 self-start"
                 >
                   <Sparkles className="w-3.5 h-3.5" />
-                  <span>{interpreting ? "Translating to Shop Search..." : "Interpret Space & Search"}</span>
+                  <span>
+                    {interpreting
+                      ? "Analyzing Live Video Stream..."
+                      : "Interpret Live Video & Search"}
+                  </span>
                 </button>
               </div>
             </div>

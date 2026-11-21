@@ -115,21 +115,26 @@ async function startServer() {
 
   app.post("/api/ramble/interpret", async (req, res) => {
     try {
-      const { imageBase64, mimeType, rambleText } = (req.body ?? {}) as {
+      const { videoFrames, imageBase64, mimeType, rambleText } = (req.body ?? {}) as {
+        videoFrames?: string[];
         imageBase64?: string;
         mimeType?: string;
         rambleText?: string;
       };
+      const cleanedFrames = Array.isArray(videoFrames)
+        ? videoFrames.filter((f): f is string => typeof f === "string" && f.length > 0).slice(-4)
+        : [];
       const cleanedText = rambleText?.trim() || "";
-      if (!cleanedText && !imageBase64) {
+      if (!cleanedText && cleanedFrames.length === 0 && !imageBase64) {
         return res.status(400).json({
-          error: "Please enable the camera / snap a photo or describe what you need.",
+          error: "Start live video or describe what fits your space first.",
         });
       }
       const effectivePrompt =
         cleanedText ||
-        "Identify the main product or space need shown in this camera frame and generate a concise Shop MCP product search query.";
+        "Analyze the live camera video stream and generate a concise Shop MCP product search query for the main item or space need shown.";
       const interpretation = await interpretSpaceAndRamble({
+        videoFrames: cleanedFrames,
         imageBase64: imageBase64 ?? null,
         mimeType: mimeType ?? "image/jpeg",
         rambleText: effectivePrompt,
