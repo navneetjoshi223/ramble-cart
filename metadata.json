@@ -1,0 +1,11 @@
+{
+  "name": "Ramble Cart",
+  "description": "Real-time video and voice shopping agent powered by Gemini 4, Decisions API, and Shopify Shop MCP.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
