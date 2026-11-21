@@ -120,13 +120,19 @@ async function startServer() {
         mimeType?: string;
         rambleText?: string;
       };
-      if (!rambleText || !rambleText.trim()) {
-        return res.status(400).json({ error: "Please enter or dictate what you need." });
+      const cleanedText = rambleText?.trim() || "";
+      if (!cleanedText && !imageBase64) {
+        return res.status(400).json({
+          error: "Please enable the camera / snap a photo or describe what you need.",
+        });
       }
+      const effectivePrompt =
+        cleanedText ||
+        "Identify the main product or space need shown in this camera frame and generate a concise Shop MCP product search query.";
       const interpretation = await interpretSpaceAndRamble({
         imageBase64: imageBase64 ?? null,
         mimeType: mimeType ?? "image/jpeg",
-        rambleText: rambleText.trim(),
+        rambleText: effectivePrompt,
       });
       res.json(interpretation);
     } catch (err) {

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import {
   Camera,
   ExternalLink,
@@ -10,6 +10,9 @@ import {
   Info,
   AlertTriangle,
   Sparkles,
+  RefreshCw,
+  Upload,
+  X,
 } from "lucide-react";
 import type {
   NormalizedProduct,
@@ -49,8 +52,14 @@ export function App() {
   const [inspectedProduct, setInspectedProduct] = useState<NormalizedProduct | null>(null);
 
   // Minimal Phase 1 Space Camera & Voice Capture (optional helper for Shop MCP search)
-  const [spaceOpen, setSpaceOpen] = useState(false);
+  const [spaceOpen, setSpaceOpen] = useState(true);
   const [cameraActive, setCameraActive] = useState(false);
+  const [facingMode, setFacingMode] = useState<"environment" | "user">("environment");
+  const [capturedImage, setCapturedImage] = useState<{
+    dataUrl: string;
+    base64: string;
+    mimeType: string;
+  } | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [rambleText, setRambleText] = useState("");
   const [dictating, setDictating] = useState(false);
@@ -60,6 +69,7 @@ export function App() {
 
   const searchAbortRef = useRef<AbortController | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const recognitionRef = useRef<{ stop: () => void } | null>(null);
 
@@ -152,26 +162,61 @@ export function App() {
     runSearch();
   }
 
-  async function startCamera() {
+  useEffect(() => {
+    if (cameraActive && videoRef.current && cameraStreamRef.current) {
+      videoRef.current.srcObject = cameraStreamRef.current;
+      videoRef.current.play().catch(() => {});
+    }
+  }, [cameraActive, spaceOpen]);
+
+  async function startCamera(preferredFacing: "environment" | "user" = facingMode) {
     setCameraError(null);
+    setCapturedImage(null);
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setCameraError(
+        "Live camera stream is not supported in this browser context. Use 'Snap / Upload Photo' below.",
+      );
+      return;
+    }
+
+    // Stop any existing tracks before opening a new stream
+    if (cameraStreamRef.current) {
+      cameraStreamRef.current.getTracks().forEach((t) => t.stop());
+      cameraStreamRef.current = null;
+    }
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false,
-      });
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: preferredFacing },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        });
+      } catch {
+        // Fallback to any available video input device
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
+      }
+
       cameraStreamRef.current = stream;
+      setFacingMode(preferredFacing);
       setCameraActive(true);
-      requestAnimationFrame(() => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.play().catch(() => {});
-        }
-      });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play().catch(() => {});
+      }
     } catch (err) {
       setCameraError(
         err instanceof Error
-          ? `Camera unavailable (${err.message}).`
-          : "Camera permission denied.",
+          ? `Live camera blocked (${err.message}). Use 'Snap / Upload Photo' instead.`
+          : "Camera permission denied. Use 'Snap / Upload Photo' instead.",
       );
       setCameraActive(false);
     }
@@ -186,6 +231,63 @@ export function App() {
       videoRef.current.srcObject = null;
     }
     setCameraActive(false);
+  }
+
+  function flipCamera() {
+    const nextFacing = facingMode === "environment" ? "user" : "environment";
+    startCamera(nextFacing);
+  }
+
+  function captureVideoFrame(): { dataUrl: string; base64: string; mimeType: string } | null {
+    const video = videoRef.current;
+    if (!video || video.videoWidth === 0 || video.videoHeight === 0) {
+      return null;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = 640;
+    canvas.height = Math.round((video.videoHeight / video.videoWidth) * 640) || 360;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.75);
+    const base64 = dataUrl.split(",")[1] || "";
+    if (!base64) return null;
+    const snap = { dataUrl, base64, mimeType: "image/jpeg" };
+    setCapturedImage(snap);
+    return snap;
+  }
+
+  function handlePhotoFileChange(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setCameraError(null);
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        const maxDim = 640;
+        const scale = Math.min(1, maxDim / Math.max(img.width || 640, img.height || 640));
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.78);
+          const base64 = dataUrl.split(",")[1] || "";
+          if (base64) {
+            setCapturedImage({ dataUrl, base64, mimeType: "image/jpeg" });
+            stopCamera();
+          }
+        }
+      };
+      if (typeof reader.result === "string") {
+        img.src = reader.result;
+      }
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
   }
 
   function toggleDictation() {
@@ -238,33 +340,28 @@ export function App() {
   }
 
   async function handleInterpretAndSearch() {
-    if (!rambleText.trim()) {
-      setInterpretError("Speak or type what fits your space first.");
+    let activeSnap = capturedImage;
+    if (!activeSnap && cameraActive) {
+      activeSnap = captureVideoFrame();
+    }
+
+    if (!rambleText.trim() && !activeSnap) {
+      setInterpretError(
+        "Enable the camera, snap/upload a photo, or describe what fits your space first.",
+      );
       return;
     }
+
     setInterpreting(true);
     setInterpretError(null);
-
-    let imageBase64: string | undefined;
-    if (cameraActive && videoRef.current && videoRef.current.videoWidth > 0) {
-      const video = videoRef.current;
-      const canvas = document.createElement("canvas");
-      canvas.width = 640;
-      canvas.height = Math.round((video.videoHeight / video.videoWidth) * 640) || 360;
-      const ctx = canvas.getContext("2d");
-      if (ctx) {
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        imageBase64 = canvas.toDataURL("image/jpeg", 0.7).split(",")[1];
-      }
-    }
 
     try {
       const parsed = await safeFetchJson<SpaceQueryInterpretation>("/api/ramble/interpret", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          imageBase64,
-          mimeType: "image/jpeg",
+          imageBase64: activeSnap?.base64,
+          mimeType: activeSnap?.mimeType ?? "image/jpeg",
           rambleText: rambleText.trim(),
         }),
       });
@@ -360,34 +457,101 @@ export function App() {
             <div className="bg-white rounded-xl border border-[#E7E5E0] p-5 grid grid-cols-1 lg:grid-cols-12 gap-6">
               <div className="lg:col-span-5 space-y-3">
                 <div className="relative aspect-video rounded-lg overflow-hidden bg-[#18181B] border border-[#E7E5E0]">
-                  {cameraActive ? (
-                    <video
-                      ref={videoRef}
-                      playsInline
-                      muted
-                      autoPlay
-                      className="w-full h-full object-cover"
-                    />
-                  ) : (
+                  <video
+                    ref={videoRef}
+                    playsInline
+                    muted
+                    autoPlay
+                    className={
+                      cameraActive && !capturedImage
+                        ? "w-full h-full object-cover"
+                        : "hidden"
+                    }
+                  />
+                  {capturedImage ? (
+                    <div className="relative w-full h-full">
+                      <img
+                        src={capturedImage.dataUrl}
+                        alt="Captured space frame"
+                        className="w-full h-full object-cover"
+                      />
+                      <span className="absolute bottom-2 left-2 px-2 py-0.5 rounded bg-black/75 text-white text-[11px] font-medium">
+                        Frame ready for Gemini
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setCapturedImage(null)}
+                        aria-label="Clear captured photo"
+                        className="absolute top-2 right-2 min-h-[32px] px-2.5 py-1 rounded-md bg-black/75 text-white text-xs font-medium hover:bg-black flex items-center gap-1"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        <span>Clear</span>
+                      </button>
+                    </div>
+                  ) : !cameraActive ? (
                     <div className="w-full h-full flex flex-col items-center justify-center text-[#A8A29E] px-4 text-center">
                       <Camera className="w-7 h-7 mb-2 opacity-70" />
-                      <p className="text-xs">Enable camera to inspect your desk, shelf, or wall.</p>
+                      <p className="text-xs">
+                        Enable live camera or snap/upload a photo of your desk, shelf, or item.
+                      </p>
                     </div>
-                  )}
+                  ) : null}
                 </div>
-                <div className="flex items-center gap-2">
+
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  onChange={handlePhotoFileChange}
+                  className="hidden"
+                  aria-label="Upload or capture space photo"
+                />
+
+                <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    onClick={cameraActive ? stopCamera : startCamera}
+                    onClick={() => (cameraActive ? stopCamera() : startCamera())}
                     className="min-h-[40px] px-3.5 py-2 rounded-lg bg-[#18181B] text-white text-xs font-medium flex items-center gap-1.5"
                   >
                     {cameraActive ? <VideoOff className="w-3.5 h-3.5" /> : <Camera className="w-3.5 h-3.5" />}
                     <span>{cameraActive ? "Stop Camera" : "Enable Camera"}</span>
                   </button>
-                  {cameraError && (
-                    <span className="text-xs text-[#991B1B]">{cameraError}</span>
+
+                  {cameraActive && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={captureVideoFrame}
+                        className="min-h-[40px] px-3 py-2 rounded-lg border border-[#1F4E3D] bg-[#F7F6F3] text-[#1F4E3D] text-xs font-medium hover:bg-[#1F4E3D] hover:text-white transition-colors"
+                      >
+                        Snap Frame
+                      </button>
+                      <button
+                        type="button"
+                        onClick={flipCamera}
+                        aria-label="Flip camera"
+                        className="min-h-[40px] px-3 py-2 rounded-lg border border-[#E7E5E0] bg-white text-[#18181B] text-xs font-medium hover:border-[#18181B] flex items-center gap-1"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        <span>Flip</span>
+                      </button>
+                    </>
                   )}
+
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="min-h-[40px] px-3 py-2 rounded-lg border border-[#E7E5E0] bg-white text-[#18181B] text-xs font-medium hover:border-[#18181B] flex items-center gap-1.5"
+                  >
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>Snap / Upload Photo</span>
+                  </button>
                 </div>
+
+                {cameraError && (
+                  <p className="text-xs text-[#991B1B]">{cameraError}</p>
+                )}
               </div>
 
               <div className="lg:col-span-7 flex flex-col justify-between gap-4">
